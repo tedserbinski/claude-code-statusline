@@ -68,27 +68,15 @@ if [ -n "$cwd" ]; then
   fi
 fi
 
-# --- Installed Claude Code version (cached; read from versioned symlink) ---
-# Fast path: ~/.local/bin/claude is a symlink whose target ends in the version.
-# Fallback: `claude --version` is slower (~300ms) but works for other install methods.
+# --- Installed Claude Code version (read from versioned symlink) ---
+# ~/.local/bin/claude is a symlink whose target ends in the version.
+# readlink is a single syscall (<1ms), cheaper than the stat+date math a cache would cost.
 installed_version=""
 if [ -n "$cc_version" ]; then
-  ver_cache="${TMPDIR:-/tmp}/claude-sl-installed-version"
-  # Sentinel larger than any plausible TTL so a missing cache always triggers a refresh
-  ver_cache_age=999999999
-  if [ -f "$ver_cache" ]; then
-    ver_cache_age=$(( $(date +%s) - $(stat -f%m "$ver_cache" 2>/dev/null || echo 0) ))
-  fi
-  # Installed version cache: 12 hours (43200s)
-  if [ "$ver_cache_age" -ge 43200 ]; then
-    claude_bin=$(command -v claude 2>/dev/null)
-    if [ -n "$claude_bin" ] && [ -L "$claude_bin" ]; then
-      target=$(readlink "$claude_bin" 2>/dev/null)
-      installed_version="${target##*/}"
-    fi
-    printf '%s' "$installed_version" > "$ver_cache" 2>/dev/null
-  else
-    installed_version=$(cat "$ver_cache" 2>/dev/null)
+  claude_bin=$(command -v claude 2>/dev/null)
+  if [ -n "$claude_bin" ] && [ -L "$claude_bin" ]; then
+    target=$(readlink "$claude_bin" 2>/dev/null)
+    installed_version="${target##*/}"
   fi
 fi
 

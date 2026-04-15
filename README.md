@@ -14,7 +14,6 @@ A compact, single-line statusline for [Claude Code](https://claude.com/claude-co
 - **Color-coded progress bars** — braille block bars (`⣿⣀`) for context usage and the 5-hour rate window, green under 50%, yellow 50–79%, red 80% and up.
 - **Single-pass jq extraction** — one `jq` invocation pulls all fields, avoiding the ~20-process fan-out of naive scripts.
 - **Cached git branch** — 5-second TTL so `git symbolic-ref` doesn't run on every statusline tick.
-- **Cached version check** — 12-hour TTL for the installed-version lookup, so the update check costs effectively nothing.
 - **Terminal-safe output** — leading and trailing ANSI resets prevent color bleed into surrounding content, no trailing newline (Claude Code counts newlines to determine row count).
 
 ## Statusline Elements
@@ -91,7 +90,6 @@ All the meaningful knobs are in the top of `statusline-command.sh`:
 - **Colors** — the `C_CYAN`, `C_GREEN`, etc. variables at lines 7–14 use standard ANSI 16-color codes and 256-color escapes. Swap in your own palette.
 - **Bar width** — `build_bar`'s default total is 10 blocks (line 18). Lower it for more compact bars, raise it for more granularity.
 - **Usage thresholds** — the 50% / 80% color break points live in `build_bar` and `pct_color_val` (lines 22–33). Change them if you want different warning levels.
-- **Update-check TTL** — the installed-version cache defaults to 12 hours (line ~82). Lower for faster update detection, raise for less filesystem churn.
 - **Git cache TTL** — defaults to 5 seconds (line ~54). Raise it if your repo is huge and git calls are slow.
 
 ## How the Update Indicator Works
@@ -101,13 +99,9 @@ The script detects an installed-but-not-running Claude Code update by comparing 
 1. **Running version** — read from the `version` field of the JSON payload that Claude Code pipes to the script's stdin.
 2. **Installed version** — read from the target of the `claude` binary symlink. Claude Code's installer creates `~/.local/bin/claude` as a symlink pointing at `~/.local/share/claude/versions/<version>/`, so the version number is literally the last path component of the symlink target.
 
-Reading the symlink is a single `readlinkat()` syscall (<1ms), far cheaper than spawning `claude --version`. The result is cached in `$TMPDIR/claude-sl-installed-version` for 12 hours by default.
+Reading the symlink is a single `readlinkat()` syscall (<1ms), so it runs on every tick with no cache — keeping it cache-free means the indicator disappears immediately when Claude Code auto-updates mid-session.
 
-If the running and installed versions differ, `update_available` is set and a green `↻` is appended to the version display in the statusline. To force an immediate re-check (e.g., right after updating), delete the cache file:
-
-```sh
-rm -f "$TMPDIR/claude-sl-installed-version"
-```
+If the running and installed versions differ, `update_available` is set and a green `↻` is appended to the version display in the statusline.
 
 Note that the symlink approach only works for Claude Code installed via the native installer. If you installed through a package manager (Homebrew, npm global), `claude` may not be a symlink and the update indicator will silently do nothing.
 
