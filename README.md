@@ -12,6 +12,7 @@ A compact, single-line statusline for [Claude Code](https://claude.com/claude-co
 - **Update-ready indicator** — a green refresh arrow (`↻`) appears next to the version number when a newer Claude Code is installed than the one currently running. Detected by reading the versioned symlink target, no subprocess spawn.
 - **Graceful degradation** — every element is conditional. If a field is missing from the input JSON (older Claude Code versions, pending data before the first API response, etc.), the section is silently skipped rather than showing `null` or `0`.
 - **Color-coded progress bars** — braille block bars (`⣿⣀`) for context usage and the 5-hour rate window, green under 50%, yellow 50–79%, red 80% and up.
+- **Pace-aware rate tracking** — the 5-hour bar appends a `⇡N%` (red, over-pace) or `⇣N%` (green, under-pace) delta comparing your actual burn rate to linear time-proportional use. 60% used with 4h left means something very different than 60% used with 30 minutes left; the delta surfaces that gap. Inspired by [claude-pace](https://github.com/Astro-Han/claude-pace).
 - **Single-pass jq extraction** — one `jq` invocation pulls all fields, avoiding the ~20-process fan-out of naive scripts.
 - **Cached git branch** — 5-second TTL so `git symbolic-ref` doesn't run on every statusline tick.
 - **Terminal-safe output** — leading and trailing ANSI resets prevent color bleed into surrounding content, no trailing newline (Claude Code counts newlines to determine row count).
@@ -28,7 +29,8 @@ From left to right, each element is separated by a dim `·`:
 | **Lines changed** | `+35/-31` | green / red | Session total of lines added and removed by the model. |
 | **Model** | `◆ Opus 4.6` | yellow | `Claude` prefix is stripped for compactness. |
 | **Context usage** | `⛁ ⣿⣿⣀⣀⣀⣀⣀⣀⣀⣀ 23%` | green / yellow / red | Percent of the context window consumed by the current conversation. Shows `⛁ --` before the first API response. |
-| **5-hour window** | `⏱ ⣿⣀⣀⣀⣀⣀⣀⣀⣀⣀ 8%` | green / yellow / red | Percent of the 5-hour rate limit used. Claude Pro/Max only. Shows `⏱ --` before the first API response. |
+| **5-hour window** | `⏱ ⣿⣀⣀⣀⣀⣀⣀⣀⣀⣀ 8% ⇣10%` | green / yellow / red | Percent of the 5-hour rate limit used. Claude Pro/Max only. Shows `⏱ --` before the first API response. Appends a pace delta when `resets_at` is present — see below. |
+| **Pace delta** | `⇡15%` / `⇣15%` | red / green | How far ahead or behind you are vs. linear burn-through of the 5-hour window. `⇡N%` (red) = overspending, slow down. `⇣N%` (green) = headroom. Hidden when `|delta|` < 3% to reduce noise. |
 | **Output style** | `☰Explanatory` | magenta | Hidden when the style is `default`. Shows when you're in Learning, Explanatory, or a custom style. |
 | **Effort level** | `effort:high` | grey | Only when an effort level is set. |
 | **Vim mode** | `vim:NORMAL` | grey | Only when vim mode is active. |
@@ -91,6 +93,7 @@ All the meaningful knobs are in the top of `statusline-command.sh`:
 - **Bar width** — `build_bar`'s default total is 10 blocks (line 18). Lower it for more compact bars, raise it for more granularity.
 - **Usage thresholds** — the 50% / 80% color break points live in `build_bar` and `pct_color_val` (lines 22–33). Change them if you want different warning levels.
 - **Git cache TTL** — defaults to 5 seconds (line ~54). Raise it if your repo is huge and git calls are slow.
+- **Pace noise threshold** — `PACE_THRESHOLD=3` (search for it). Hides `⇡`/`⇣` deltas smaller than this percentage. Lower to see micro-drifts, raise to only flag serious over/under-pacing.
 
 ## How the Update Indicator Works
 
@@ -130,6 +133,7 @@ Note that the symlink approach only works for Claude Code installed via the nati
 - Simple repo to share inspired by [levz0r's claude-code-statusline](https://github.com/levz0r/claude-code-statusline/)
 - ANSI handling and leading-reset pattern borrowed from [sirmalloc/ccstatusline](https://github.com/sirmalloc/ccstatusline).
 - Single-jq-call optimization pattern borrowed from [martinemde/starship-claude](https://github.com/martinemde/starship-claude).
+- Pace delta concept (⇡/⇣ over-/under-pace tracking vs. linear window burn-through) borrowed from [Astro-Han/claude-pace](https://github.com/Astro-Han/claude-pace).
 - Official Claude Code statusline docs: <https://code.claude.com/docs/en/statusline>
 
 ## License

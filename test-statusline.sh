@@ -198,6 +198,60 @@ run_test "No context/rate data (-- indicators)" '{
   "model":{"display_name":"Claude Opus 4.6"}
 }'
 
+# --- Scenario 17a: Pace delta - over-pace (⇡) ---
+# 60% used with only 1h of the 5h window elapsed → expected=20%, delta=+40
+RESET_4H=$(($(date +%s) + 14400))
+run_test "Pace: over-pace shows ⇡N%" "{
+  \"workspace\":{\"current_dir\":\"/tmp\"},
+  \"model\":{\"display_name\":\"Claude Opus 4.6\"},
+  \"rate_limits\":{\"five_hour\":{\"used_percentage\":60,\"resets_at\":${RESET_4H}}}
+}"
+out=$(echo "{\"workspace\":{\"current_dir\":\"/tmp\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":60,\"resets_at\":${RESET_4H}}}}" | bash "$SCRIPT" 2>/dev/null)
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⇡'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Pace over-pace renders ⇡ glyph\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Pace over-pace missing ⇡ glyph — output: %s\n" "$out"
+fi
+
+# --- Scenario 17b: Pace delta - under-pace (⇣) ---
+# 10% used with 4h of the 5h window elapsed → expected=80%, delta=-70
+RESET_1H=$(($(date +%s) + 3600))
+run_test "Pace: under-pace shows ⇣N%" "{
+  \"workspace\":{\"current_dir\":\"/tmp\"},
+  \"model\":{\"display_name\":\"Claude Opus 4.6\"},
+  \"rate_limits\":{\"five_hour\":{\"used_percentage\":10,\"resets_at\":${RESET_1H}}}
+}"
+out=$(echo "{\"workspace\":{\"current_dir\":\"/tmp\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":10,\"resets_at\":${RESET_1H}}}}" | bash "$SCRIPT" 2>/dev/null)
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⇣'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Pace under-pace renders ⇣ glyph\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Pace under-pace missing ⇣ glyph — output: %s\n" "$out"
+fi
+
+# --- Scenario 17c: Pace delta - on-pace hidden (< threshold) ---
+# 50% used with 2.5h elapsed → expected=50%, delta=0, should be hidden
+RESET_2_5H=$(($(date +%s) + 9000))
+run_test "Pace: on-pace hidden (|delta|<3)" "{
+  \"workspace\":{\"current_dir\":\"/tmp\"},
+  \"model\":{\"display_name\":\"Claude Opus 4.6\"},
+  \"rate_limits\":{\"five_hour\":{\"used_percentage\":50,\"resets_at\":${RESET_2_5H}}}
+}"
+out=$(echo "{\"workspace\":{\"current_dir\":\"/tmp\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":50,\"resets_at\":${RESET_2_5H}}}}" | bash "$SCRIPT" 2>/dev/null)
+TOTAL=$((TOTAL + 1))
+if ! echo "$out" | grep -qE '⇡|⇣'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Pace on-pace correctly hidden\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Pace on-pace should have been hidden — output: %s\n" "$out"
+fi
+
 # --- Scenario 17: Rapid redraw (consistency) ---
 echo ""
 echo "  Rapid redraw test (20 iterations)..."

@@ -45,6 +45,7 @@ eval "$(echo "$input" | jq -r '
   @sh "session_id=\(.session_id // "")",
   @sh "effort=\(.effortLevel // .effort_level // .effort // "")",
   @sh "five_hour_pct=\(.rate_limits.five_hour.used_percentage // "")",
+  @sh "five_hour_reset=\(.rate_limits.five_hour.resets_at // 0)",
   @sh "cc_version=\(.version // "")"
 ')"
 model="${model#Claude }"
@@ -129,11 +130,30 @@ else
 fi
 
 # Rate limit bar
+# Pace delta: how far ahead/behind you are vs. linear burn-through of the window.
+# ⇡N% (red) = used N% more than time-proportional → slow down.
+# ⇣N% (green) = used N% less than time-proportional → headroom.
+# Hidden when |delta| < PACE_THRESHOLD to reduce noise.
+PACE_THRESHOLD=3
 if [ -n "$five_hour_pct" ]; then
   printf -v fh_int "%.0f" "$five_hour_pct" 2>/dev/null
   build_bar "$fh_int"
   pct_color_val "$fh_int"
-  parts+=("${_pct_color}⏱${C_RESET} ${_bar_result} ${fh_int}%")
+  pace=""
+  if [[ "$five_hour_reset" =~ ^[0-9]+$ ]] && (( five_hour_reset > 0 )); then
+    secs_remaining=$(( five_hour_reset - $(date +%s) ))
+    # Window is 5h = 18000s. Skip if reset is in the past or impossibly far.
+    if (( secs_remaining > 0 && secs_remaining <= 18000 )); then
+      expected=$(( (18000 - secs_remaining) * 100 / 18000 ))
+      delta=$(( fh_int - expected ))
+      if (( delta >= PACE_THRESHOLD )); then
+        pace=" ${C_RED}⇡${delta}%${C_RESET}"
+      elif (( delta <= -PACE_THRESHOLD )); then
+        pace=" ${C_GREEN}⇣$(( -delta ))%${C_RESET}"
+      fi
+    fi
+  fi
+  parts+=("${_pct_color}⏱${C_RESET} ${_bar_result} ${fh_int}%${pace}")
 else
   parts+=("${C_GREY}⏱ --${C_RESET}")
 fi
