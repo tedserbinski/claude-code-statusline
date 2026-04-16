@@ -234,6 +234,32 @@ else
   printf "  \033[31m✗\033[0m Pace under-pace missing ⇣ glyph — output: %s\n" "$out"
 fi
 
+# --- Scenario 17d: Reset countdown - hours format ---
+# 4h = 14400s remaining → should render "4h"
+RESET_4H_COUNT=$(($(date +%s) + 14400))
+out=$(echo "{\"workspace\":{\"current_dir\":\"/tmp\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":50,\"resets_at\":${RESET_4H_COUNT}}}}" | bash "$SCRIPT" 2>/dev/null)
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qE '4h'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Reset countdown renders '4h' format\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Reset countdown missing '4h' — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e: Reset countdown - minutes format ---
+# 45min = 2700s remaining → should render "45m"
+RESET_45M=$(($(date +%s) + 2700))
+out=$(echo "{\"workspace\":{\"current_dir\":\"/tmp\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":85,\"resets_at\":${RESET_45M}}}}" | bash "$SCRIPT" 2>/dev/null)
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qE '45m'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Reset countdown renders '45m' format\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Reset countdown missing '45m' — output: %s\n" "$out"
+fi
+
 # --- Scenario 17c: Pace delta - on-pace hidden (< threshold) ---
 # 50% used with 2.5h elapsed → expected=50%, delta=0, should be hidden
 RESET_2_5H=$(($(date +%s) + 9000))

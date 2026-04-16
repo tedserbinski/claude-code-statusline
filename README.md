@@ -29,8 +29,9 @@ From left to right, each element is separated by a dim `·`:
 | **Lines changed** | `+35/-31` | green / red | Session total of lines added and removed by the model. |
 | **Model** | `◆ Opus 4.6` | yellow | `Claude` prefix is stripped for compactness. |
 | **Context usage** | `⛁ ⣿⣿⣀⣀⣀⣀⣀⣀⣀⣀ 23%` | green / yellow / red | Percent of the context window consumed by the current conversation. Shows `⛁ --` before the first API response. |
-| **5-hour window** | `⏱ ⣿⣀⣀⣀⣀⣀⣀⣀⣀⣀ 8% ⇣10%` | green / yellow / red | Percent of the 5-hour rate limit used. Claude Pro/Max only. Shows `⏱ --` before the first API response. Appends a pace delta when `resets_at` is present — see below. |
+| **5-hour window** | `⏱ ⣿⣀⣀⣀⣀⣀⣀⣀⣀⣀ 8% ⇣10% 3h` | green / yellow / red | Percent of the 5-hour rate limit used. Claude Pro/Max only. Shows `⏱ --` before the first API response. Appends a pace delta and reset countdown when `resets_at` is present — see below. |
 | **Pace delta** | `⇡15%` / `⇣15%` | red / green | How far ahead or behind you are vs. linear burn-through of the 5-hour window. `⇡N%` (red) = overspending, slow down. `⇣N%` (green) = headroom. Hidden when `|delta|` < 3% to reduce noise. |
+| **Reset countdown** | `3h` / `45m` | grey | Time remaining in the current 5-hour window. Renders as `Xh` when ≥ 60 minutes, else `Xm`. Always shown when `resets_at` is present. |
 | **Output style** | `☰Explanatory` | magenta | Hidden when the style is `default`. Shows when you're in Learning, Explanatory, or a custom style. |
 | **Effort level** | `effort:high` | grey | Only when an effort level is set. |
 | **Vim mode** | `vim:NORMAL` | grey | Only when vim mode is active. |

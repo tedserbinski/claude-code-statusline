@@ -140,6 +140,7 @@ if [ -n "$five_hour_pct" ]; then
   build_bar "$fh_int"
   pct_color_val "$fh_int"
   pace=""
+  countdown=""
   if [[ "$five_hour_reset" =~ ^[0-9]+$ ]] && (( five_hour_reset > 0 )); then
     secs_remaining=$(( five_hour_reset - $(date +%s) ))
     # Window is 5h = 18000s. Skip if reset is in the past or impossibly far.
@@ -151,9 +152,15 @@ if [ -n "$five_hour_pct" ]; then
       elif (( delta <= -PACE_THRESHOLD )); then
         pace=" ${C_GREEN}⇣$(( -delta ))%${C_RESET}"
       fi
+      mins_remaining=$(( secs_remaining / 60 ))
+      if (( mins_remaining >= 60 )); then
+        countdown=" ${C_GREY}$(( mins_remaining / 60 ))h${C_RESET}"
+      else
+        countdown=" ${C_GREY}${mins_remaining}m${C_RESET}"
+      fi
     fi
   fi
-  parts+=("${_pct_color}⏱${C_RESET} ${_bar_result} ${fh_int}%${pace}")
+  parts+=("${_pct_color}⏱${C_RESET} ${_bar_result} ${fh_int}%${pace}${countdown}")
 else
   parts+=("${C_GREY}⏱ --${C_RESET}")
 fi
