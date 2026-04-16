@@ -51,9 +51,12 @@ eval "$(echo "$input" | jq -r '
 model="${model#Claude }"
 
 # --- Git branch (cached for 5 seconds to avoid slow git calls) ---
+# Cache key includes cwd so concurrent sessions in different repos don't clash.
+# Using parameter expansion (not shasum) keeps this subprocess-free.
+# Atomic write via mktemp+mv prevents partial reads on concurrent ticks.
 git_branch=""
 if [ -n "$cwd" ]; then
-  cache_file="${TMPDIR:-/tmp}/claude-sl-git-cache"
+  cache_file="${TMPDIR:-/tmp}/claude-sl-git${cwd//\//_}"
   cache_age=999999999
   if [ -f "$cache_file" ]; then
     cache_age=$(( $(date +%s) - $(stat -f%m "$cache_file" 2>/dev/null || echo 0) ))
@@ -63,7 +66,10 @@ if [ -n "$cwd" ]; then
       git_branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null \
         || git -C "$cwd" --no-optional-locks rev-parse --short HEAD 2>/dev/null)
     fi
-    printf '%s' "$git_branch" > "$cache_file" 2>/dev/null
+    tmp_cache=$(mktemp "${cache_file}.XXXXXX" 2>/dev/null)
+    if [ -n "$tmp_cache" ]; then
+      printf '%s' "$git_branch" > "$tmp_cache" && mv "$tmp_cache" "$cache_file"
+    fi
   else
     git_branch=$(cat "$cache_file" 2>/dev/null)
   fi

@@ -260,6 +260,24 @@ else
   printf "  \033[31m✗\033[0m Reset countdown missing '45m' — output: %s\n" "$out"
 fi
 
+# --- Scenario 17f: Git cache isolation between repos ---
+# Verify that two concurrent sessions in different repos don't share branch cache.
+REPO_A=$(mktemp -d)
+REPO_B=$(mktemp -d)
+(cd "$REPO_A" && git init -q -b branch-alpha 2>/dev/null && git commit --allow-empty -q -m "init" 2>/dev/null)
+(cd "$REPO_B" && git init -q -b branch-beta  2>/dev/null && git commit --allow-empty -q -m "init" 2>/dev/null)
+out_a=$(echo "{\"workspace\":{\"current_dir\":\"$REPO_A\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"}}" | bash "$SCRIPT" 2>/dev/null)
+out_b=$(echo "{\"workspace\":{\"current_dir\":\"$REPO_B\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"}}" | bash "$SCRIPT" 2>/dev/null)
+TOTAL=$((TOTAL + 1))
+if echo "$out_a" | grep -qF 'branch-alpha' && echo "$out_b" | grep -qF 'branch-beta' && ! echo "$out_b" | grep -qF 'branch-alpha'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Git cache isolated per cwd (no cross-repo pollution)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Git cache leak — A:%s  B:%s\n" "$out_a" "$out_b"
+fi
+rm -rf "$REPO_A" "$REPO_B"
+
 # --- Scenario 17c: Pace delta - on-pace hidden (< threshold) ---
 # 50% used with 2.5h elapsed → expected=50%, delta=0, should be hidden
 RESET_2_5H=$(($(date +%s) + 9000))
