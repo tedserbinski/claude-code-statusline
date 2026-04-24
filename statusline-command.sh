@@ -43,7 +43,7 @@ eval "$(echo "$input" | jq -r '
   @sh "vim_mode=\(.vim.mode // "")",
   @sh "session_name=\(.session_name // "")",
   @sh "session_id=\(.session_id // "")",
-  @sh "effort=\(.effortLevel // .effort_level // .effort // "")",
+  @sh "effort=\((.effort | if type == "object" then .level // "" else . // "" end) // .effortLevel // .effort_level // "")",
   @sh "five_hour_pct=\(.rate_limits.five_hour.used_percentage // "")",
   @sh "five_hour_reset=\(.rate_limits.five_hour.resets_at // 0)",
   @sh "cc_version=\(.version // "")"
