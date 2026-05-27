@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Claude Code status line — compact braille style
 
+# All status fields are assigned in a single eval of jq @sh output (see below); shellcheck
+# can't trace assignments through eval, so SC2154 ("referenced but not assigned") is a false
+# positive for every one of them. Suppress it file-wide rather than at each use site.
+# shellcheck disable=SC2154
+
 input=$(cat)
 
 # --- ANSI colors ---
@@ -18,6 +23,8 @@ build_bar() {
   local pct=${1:-0} total=${2:-10}
   local filled=$(( (pct * total + 50) / 100 ))
   local bar=""
+  # 10 cells = 10% increments. Braille fill: ⣿ (all 8 dots, gap-free) for filled, ⣀ (low baseline
+  # dots) for the empty track. Swap these two glyphs to restyle (e.g. █/░ solid, ⡇/⡀ thin).
   for ((i=0; i<filled; i++));     do bar="${bar}⣿"; done
   for ((i=filled; i<total; i++)); do bar="${bar}⣀"; done
   local color="$C_GREEN"
@@ -30,6 +37,35 @@ pct_color_val() {
   _pct_color="$C_GREEN"
   (( ${1:-0} >= 50 )) && _pct_color="$C_YELLOW"
   (( ${1:-0} >= 80 )) && _pct_color="$C_RED"
+}
+
+# --- Rate-limit segment builder ---
+# Renders one rate window the way Claude Code's own /usage view does: glyph + bar + used% + the
+# absolute time the window resets. No pacing/projection — just "how much used, and when it resets".
+#   ↻8:10pm = resets later today at that clock time.
+#   ↻Jun 1  = resets on that date (shown when the reset isn't today). Result in _rate_segment.
+build_rate_segment() {
+  local used_raw="$1" reset_ts="$2" window="$3" glyph="$4"
+  local u_int; printf -v u_int "%.0f" "$used_raw" 2>/dev/null
+  build_bar "$u_int"
+  pct_color_val "$u_int"
+  local reset=""
+  if [[ "$reset_ts" =~ ^[0-9]+$ ]] && (( reset_ts > 0 )); then
+    # One `date` reads now+today; another formats the reset. Trust the reset only when it's in
+    # the future and no further out than the window itself (guards stale/garbage timestamps).
+    local now_today; now_today=$(date '+%s|%F')
+    local now="${now_today%%|*}" today="${now_today#*|}"
+    if (( reset_ts > now && reset_ts - now <= window )); then
+      # %F=date (same-day check), %l:%M%p=clock time, %b %e=month/day — formatted in one call.
+      local fmt; fmt=$(date -r "$reset_ts" '+%F|%l:%M%p|%b %e')
+      local r_day="${fmt%%|*}" rest="${fmt#*|}"
+      local r
+      if [ "$today" = "$r_day" ]; then r="${rest%%|*}"; else r="${rest#*|}"; fi
+      r="${r//  / }"; r="${r# }"; r="${r//AM/am}"; r="${r//PM/pm}"   # "  8:10PM" → "8:10pm"
+      reset=" ${C_GREY}↻${r}${C_RESET}"
+    fi
+  fi
+  _rate_segment="${_pct_color}${glyph} ${u_int}%${C_RESET} ${_bar_result}${reset}"
 }
 
 # --- Extract all fields in a single jq call ---
@@ -46,6 +82,8 @@ eval "$(echo "$input" | jq -r '
   @sh "effort=\((.effort | if type == "object" then .level // "" else . // "" end) // .effortLevel // .effort_level // "")",
   @sh "five_hour_pct=\(.rate_limits.five_hour.used_percentage // "")",
   @sh "five_hour_reset=\(.rate_limits.five_hour.resets_at // 0)",
+  @sh "seven_day_pct=\(.rate_limits.seven_day.used_percentage // "")",
+  @sh "seven_day_reset=\(.rate_limits.seven_day.resets_at // 0)",
   @sh "cc_version=\(.version // "")"
 ')"
 model="${model#Claude }"
@@ -130,45 +168,23 @@ if [ -n "$ctx_pct" ]; then
   printf -v ctx_int "%.0f" "$ctx_pct" 2>/dev/null
   build_bar "$ctx_int"
   pct_color_val "$ctx_int"
-  parts+=("${_pct_color}⛁${C_RESET} ${_bar_result} ${ctx_int}%")
+  parts+=("${_pct_color}⛁ ${ctx_int}%${C_RESET} ${_bar_result}")
 else
   parts+=("${C_GREY}⛁ --${C_RESET}")
 fi
 
-# Rate limit bar
-# Pace delta: how far ahead/behind you are vs. linear burn-through of the window.
-# ⇡N% (red) = used N% more than time-proportional → slow down.
-# ⇣N% (green) = used N% less than time-proportional → headroom.
-# Hidden when |delta| < PACE_THRESHOLD to reduce noise.
-PACE_THRESHOLD=3
+# Rate limit bars — 5-hour (⏱) session window and 7-day (⧖) weekly window.
+# Each renders identically via build_rate_segment; both windows degrade independently
+# (the docs note either may be absent), so the weekly segment is simply skipped when missing.
 if [ -n "$five_hour_pct" ]; then
-  printf -v fh_int "%.0f" "$five_hour_pct" 2>/dev/null
-  build_bar "$fh_int"
-  pct_color_val "$fh_int"
-  pace=""
-  countdown=""
-  if [[ "$five_hour_reset" =~ ^[0-9]+$ ]] && (( five_hour_reset > 0 )); then
-    secs_remaining=$(( five_hour_reset - $(date +%s) ))
-    # Window is 5h = 18000s. Skip if reset is in the past or impossibly far.
-    if (( secs_remaining > 0 && secs_remaining <= 18000 )); then
-      expected=$(( (18000 - secs_remaining) * 100 / 18000 ))
-      delta=$(( fh_int - expected ))
-      if (( delta >= PACE_THRESHOLD )); then
-        pace=" ${C_RED}⇡${delta}%${C_RESET}"
-      elif (( delta <= -PACE_THRESHOLD )); then
-        pace=" ${C_GREEN}⇣$(( -delta ))%${C_RESET}"
-      fi
-      mins_remaining=$(( secs_remaining / 60 ))
-      if (( mins_remaining >= 60 )); then
-        countdown=" ${C_GREY}$(( mins_remaining / 60 ))h${C_RESET}"
-      else
-        countdown=" ${C_GREY}${mins_remaining}m${C_RESET}"
-      fi
-    fi
-  fi
-  parts+=("${_pct_color}⏱${C_RESET} ${_bar_result} ${fh_int}%${pace}${countdown}")
+  build_rate_segment "$five_hour_pct" "$five_hour_reset" 18000 "⏱"
+  parts+=("$_rate_segment")
 else
   parts+=("${C_GREY}⏱ --${C_RESET}")
+fi
+if [ -n "$seven_day_pct" ]; then
+  build_rate_segment "$seven_day_pct" "$seven_day_reset" 604800 "⧖"
+  parts+=("$_rate_segment")
 fi
 
 # Output style (hidden when default)

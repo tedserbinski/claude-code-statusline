@@ -11,8 +11,9 @@ A compact, single-line statusline for [Claude Code](https://claude.com/claude-co
 - **Session ID auto-hide** — when a session is named (via `/rename`), the lavender `[id]` block is hidden since Claude Code already shows the name in its header. Only unnamed sessions show a truncated `[abc12345]` block as a reminder to name the session.
 - **Update-ready indicator** — a green refresh arrow (`↻`) appears next to the version number when a newer Claude Code is installed than the one currently running. Detected by reading the versioned symlink target, no subprocess spawn.
 - **Graceful degradation** — every element is conditional. If a field is missing from the input JSON (older Claude Code versions, pending data before the first API response, etc.), the section is silently skipped rather than showing `null` or `0`.
-- **Color-coded progress bars** — braille block bars (`⣿⣀`) for context usage and the 5-hour rate window, green under 50%, yellow 50–79%, red 80% and up.
-- **Pace-aware rate tracking** — the 5-hour bar appends a `⇡N%` (red, over-pace) or `⇣N%` (green, under-pace) delta comparing your actual burn rate to linear time-proportional use. 60% used with 4h left means something very different than 60% used with 30 minutes left; the delta surfaces that gap. Inspired by [claude-pace](https://github.com/Astro-Han/claude-pace).
+- **Color-coded progress bars** — 10-cell braille blocks (`⣿⣀`) at 10% increments for context usage and both rate windows, with the percentage to the left: green under 50%, yellow 50–79%, red 80% and up. The gap-free fill mirrors Claude Code's own `/usage` bars.
+- **Both rate windows** — the 5-hour session window (`⏱`) and the 7-day weekly window (`⧖`) each get their own bar and reset time. Either window is rendered only when Claude Code sends it (they can be independently absent), so the weekly segment simply doesn't appear until there's data. Inspired by [claude-pace](https://github.com/Astro-Han/claude-pace).
+- **Absolute reset times** — each rate window shows *when* it resets, like the `/usage` view: `↻8:10pm` if it resets later today, `↻Jun 1` if it resets on another day. No pacing or projection math — just how much you've used and when it comes back.
 - **Single-pass jq extraction** — one `jq` invocation pulls all fields, avoiding the ~20-process fan-out of naive scripts.
 - **Cached git branch** — 5-second TTL so `git symbolic-ref` doesn't run on every statusline tick.
 - **Terminal-safe output** — leading and trailing ANSI resets prevent color bleed into surrounding content, no trailing newline (Claude Code counts newlines to determine row count).
@@ -28,10 +29,10 @@ From left to right, each element is separated by a dim `·`:
 | **Git branch** | `⎇ main` | green | Only when inside a git repo. Falls back to short commit SHA if HEAD is detached. |
 | **Lines changed** | `+35/-31` | green / red | Session total of lines added and removed by the model. |
 | **Model** | `◆ Opus 4.6` | yellow | `Claude` prefix is stripped for compactness. |
-| **Context usage** | `⛁ ⣿⣿⣀⣀⣀⣀⣀⣀⣀⣀ 23%` | green / yellow / red | Percent of the context window consumed by the current conversation. Shows `⛁ --` before the first API response. |
-| **5-hour window** | `⏱ ⣿⣀⣀⣀⣀⣀⣀⣀⣀⣀ 8% ⇣10% 3h` | green / yellow / red | Percent of the 5-hour rate limit used. Claude Pro/Max only. Shows `⏱ --` before the first API response. Appends a pace delta and reset countdown when `resets_at` is present — see below. |
-| **Pace delta** | `⇡15%` / `⇣15%` | red / green | How far ahead or behind you are vs. linear burn-through of the 5-hour window. `⇡N%` (red) = overspending, slow down. `⇣N%` (green) = headroom. Hidden when `|delta|` < 3% to reduce noise. |
-| **Reset countdown** | `3h` / `45m` | grey | Time remaining in the current 5-hour window. Renders as `Xh` when ≥ 60 minutes, else `Xm`. Always shown when `resets_at` is present. |
+| **Context usage** | `⛁ 23% ⣿⣿⣀⣀⣀⣀⣀⣀⣀⣀` | green / yellow / red | Percent of the context window consumed by the current conversation, with a 10-cell bar. Shows `⛁ --` before the first API response. |
+| **5-hour window** | `⏱ 74% ⣿⣿⣿⣿⣿⣿⣿⣀⣀⣀ ↻8:10pm` | green / yellow / red | Percent of the 5-hour rate limit used. Claude Pro/Max only. Shows `⏱ --` before the first API response. Appends the reset time when `resets_at` is present — see below. |
+| **7-day window** | `⧖ 36% ⣿⣿⣿⣿⣀⣀⣀⣀⣀⣀ ↻Jun 1` | green / yellow / red | Percent of the 7-day (weekly) rate limit used, read from `rate_limits.seven_day`. Same bar and reset time as the 5-hour window, distinguished by the `⧖` glyph. Silently skipped when the weekly window is absent from the payload. |
+| **Reset time** | `↻8:10pm` / `↻Jun 1` | grey | When the rate window resets, read from `resets_at`. Shows the clock time if it resets later today, otherwise the month + day. Hidden if the reset is in the past or further out than the window itself. |
 | **Output style** | `☰Explanatory` | magenta | Hidden when the style is `default`. Shows when you're in Learning, Explanatory, or a custom style. |
 | **Effort level** | `effort:high` | grey | Only when an effort level is set. |
 | **Vim mode** | `vim:NORMAL` | grey | Only when vim mode is active. |
@@ -39,7 +40,7 @@ From left to right, each element is separated by a dim `·`:
 
 ### Progress bar thresholds
 
-Both progress bars use the same 10-block braille display and color thresholds:
+All progress bars use the same 10-cell braille-block display and color thresholds:
 
 - **Green** — 0–49% (healthy)
 - **Yellow** — 50–79% (watch)
@@ -52,7 +53,7 @@ Both progress bars use the same 10-block braille display and color thresholds:
 - Bash 4+ (macOS ships with 3.2 — use `brew install bash` if you want full feature support; the script works on 3.2 too)
 - `jq` installed and on your `PATH`
 - [Claude Code](https://claude.com/claude-code) installed
-- A font with braille block glyphs (most modern monospaced fonts include them — confirmed working in Ghostty, iTerm2, WezTerm, Alacritty)
+- A font with braille block glyphs (`⣿` `⣀`) — included in most modern monospaced fonts; confirmed working in Ghostty, iTerm2, WezTerm, Alacritty
 
 ### Install
 
@@ -78,23 +79,24 @@ Restart Claude Code (or open a new session) and the statusline should appear at 
 
 ### Testing
 
-A test suite covering 20 scenarios (full payloads, boundary values, missing fields, rapid redraws, performance) is included:
+A test suite covering 32 checks (full payloads, boundary values, missing fields, braille bars, absolute reset times, the weekly window, rapid redraws, performance) is included:
 
 ```sh
 bash ~/claude-statusline/test-statusline.sh
 ```
 
-Expected output ends with `All 20 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
+Expected output ends with `All 32 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
 
 ## Customization
 
 All the meaningful knobs are in the top of `statusline-command.sh`:
 
-- **Colors** — the `C_CYAN`, `C_GREEN`, etc. variables at lines 7–14 use standard ANSI 16-color codes and 256-color escapes. Swap in your own palette.
-- **Bar width** — `build_bar`'s default total is 10 blocks (line 18). Lower it for more compact bars, raise it for more granularity.
-- **Usage thresholds** — the 50% / 80% color break points live in `build_bar` and `pct_color_val` (lines 22–33). Change them if you want different warning levels.
-- **Git cache TTL** — defaults to 5 seconds (line ~54). Raise it if your repo is huge and git calls are slow.
-- **Pace noise threshold** — `PACE_THRESHOLD=3` (search for it). Hides `⇡`/`⇣` deltas smaller than this percentage. Lower to see micro-drifts, raise to only flag serious over/under-pacing.
+- **Colors** — the `C_CYAN`, `C_GREEN`, etc. variables near the top (lines 12–19) use standard ANSI 16-color codes and 256-color escapes. Swap in your own palette.
+- **Bar width** — `build_bar`'s default total is 10 cells, one per 10% (search for `total=`). Lower it for more compact bars, raise it for finer granularity.
+- **Bar glyphs** — filled/empty are `⣿` and `⣀` inside `build_bar`. Swap them for a different look (e.g. `█`/`░` for solid blocks, or `⡇`/`⡀` for a thinner braille line).
+- **Usage thresholds** — the 50% / 80% color break points live in `build_bar` and `pct_color_val`. Change them if you want different warning levels.
+- **Git cache TTL** — defaults to 5 seconds (search for `cache_age` / `-ge 5`). Raise it if your repo is huge and git calls are slow.
+- **Reset time format** — `build_rate_segment` formats the reset with `date` (`%l:%M%p` for today, `%b %e` otherwise). Adjust those format strings to taste (e.g. 24-hour clock).
 
 ## How the Update Indicator Works
 
@@ -134,7 +136,7 @@ Note that the symlink approach only works for Claude Code installed via the nati
 - Simple repo to share inspired by [levz0r's claude-code-statusline](https://github.com/levz0r/claude-code-statusline/)
 - ANSI handling and leading-reset pattern borrowed from [sirmalloc/ccstatusline](https://github.com/sirmalloc/ccstatusline).
 - Single-jq-call optimization pattern borrowed from [martinemde/starship-claude](https://github.com/martinemde/starship-claude).
-- Pace delta concept (⇡/⇣ over-/under-pace tracking vs. linear window burn-through) borrowed from [Astro-Han/claude-pace](https://github.com/Astro-Han/claude-pace).
+- Tracking both rate-limit windows (5-hour and 7-day) on the statusline was inspired by [Astro-Han/claude-pace](https://github.com/Astro-Han/claude-pace).
 - Official Claude Code statusline docs: <https://code.claude.com/docs/en/statusline>
 
 ## License

@@ -198,66 +198,57 @@ run_test "No context/rate data (-- indicators)" '{
   "model":{"display_name":"Claude Opus 4.6"}
 }'
 
-# --- Scenario 17a: Pace delta - over-pace (⇡) ---
-# 60% used with only 1h of the 5h window elapsed → expected=20%, delta=+40
-RESET_4H=$(($(date +%s) + 14400))
-run_test "Pace: over-pace shows ⇡N%" "{
+# --- Scenario 17a: Reset renders as an absolute time (clock today, or a date) ---
+RESET_SOON=$(($(date +%s) + 600))
+run_test "Reset: absolute time renders" "{
   \"workspace\":{\"current_dir\":\"/tmp\"},
-  \"model\":{\"display_name\":\"Claude Opus 4.6\"},
-  \"rate_limits\":{\"five_hour\":{\"used_percentage\":60,\"resets_at\":${RESET_4H}}}
+  \"model\":{\"display_name\":\"Claude Opus 4.7\"},
+  \"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":${RESET_SOON}}}
 }"
-out=$(echo "{\"workspace\":{\"current_dir\":\"/tmp\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":60,\"resets_at\":${RESET_4H}}}}" | bash "$SCRIPT" 2>/dev/null)
+out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":${RESET_SOON}}}}" | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
-if echo "$out" | grep -qF '⇡'; then
+# Must show ↻ + a valid format: clock time (8:10pm) today, or month/day if it rolled past midnight.
+if echo "$out" | grep -qE '↻([0-9]{1,2}:[0-9]{2}(am|pm)|[A-Z][a-z][a-z] +[0-9]{1,2})'; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Pace over-pace renders ⇡ glyph\n"
+  printf "  \033[32m✓\033[0m Reset renders as an absolute time\n"
 else
   FAIL=$((FAIL + 1))
-  printf "  \033[31m✗\033[0m Pace over-pace missing ⇡ glyph — output: %s\n" "$out"
+  printf "  \033[31m✗\033[0m Reset not a valid absolute time — output: %s\n" "$out"
 fi
 
-# --- Scenario 17b: Pace delta - under-pace (⇣) ---
-# 10% used with 4h of the 5h window elapsed → expected=80%, delta=-70
-RESET_1H=$(($(date +%s) + 3600))
-run_test "Pace: under-pace shows ⇣N%" "{
-  \"workspace\":{\"current_dir\":\"/tmp\"},
-  \"model\":{\"display_name\":\"Claude Opus 4.6\"},
-  \"rate_limits\":{\"five_hour\":{\"used_percentage\":10,\"resets_at\":${RESET_1H}}}
-}"
-out=$(echo "{\"workspace\":{\"current_dir\":\"/tmp\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":10,\"resets_at\":${RESET_1H}}}}" | bash "$SCRIPT" 2>/dev/null)
+# --- Scenario 17b: No pacing glyphs, even at high usage ---
+out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":95,\"resets_at\":${RESET_SOON}}}}" | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
-if echo "$out" | grep -qF '⇣'; then
+if ! echo "$out" | grep -qE '⚠|⇡|⇣'; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Pace under-pace renders ⇣ glyph\n"
+  printf "  \033[32m✓\033[0m No pacing glyphs (⚠/⇡/⇣) shown\n"
 else
   FAIL=$((FAIL + 1))
-  printf "  \033[31m✗\033[0m Pace under-pace missing ⇣ glyph — output: %s\n" "$out"
+  printf "  \033[31m✗\033[0m Unexpected pacing glyph — output: %s\n" "$out"
 fi
 
-# --- Scenario 17d: Reset countdown - hours format ---
-# 4h = 14400s remaining → should render "4h"
-RESET_4H_COUNT=$(($(date +%s) + 14400))
-out=$(echo "{\"workspace\":{\"current_dir\":\"/tmp\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":50,\"resets_at\":${RESET_4H_COUNT}}}}" | bash "$SCRIPT" 2>/dev/null)
+# --- Scenario 17d: Past reset is hidden (bar shown, no ↻) ---
+RESET_PAST=$(($(date +%s) - 100))
+out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":${RESET_PAST}}}}" | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
-if echo "$out" | grep -qE '4h'; then
+if echo "$out" | grep -qF '40%' && ! echo "$out" | grep -qF '↻'; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Reset countdown renders '4h' format\n"
+  printf "  \033[32m✓\033[0m Past reset hidden (no ↻)\n"
 else
   FAIL=$((FAIL + 1))
-  printf "  \033[31m✗\033[0m Reset countdown missing '4h' — output: %s\n" "$out"
+  printf "  \033[31m✗\033[0m Past reset should hide ↻ — output: %s\n" "$out"
 fi
 
-# --- Scenario 17e: Reset countdown - minutes format ---
-# 45min = 2700s remaining → should render "45m"
-RESET_45M=$(($(date +%s) + 2700))
-out=$(echo "{\"workspace\":{\"current_dir\":\"/tmp\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":85,\"resets_at\":${RESET_45M}}}}" | bash "$SCRIPT" 2>/dev/null)
+# --- Scenario 17e: Far-future reset (beyond the window) is hidden ---
+RESET_FAR=$(($(date +%s) + 100000))   # ~27h, well beyond the 5h window
+out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":${RESET_FAR}}}}" | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
-if echo "$out" | grep -qE '45m'; then
+if ! echo "$out" | grep -qF '↻'; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Reset countdown renders '45m' format\n"
+  printf "  \033[32m✓\033[0m Far-future reset (beyond window) hidden\n"
 else
   FAIL=$((FAIL + 1))
-  printf "  \033[31m✗\033[0m Reset countdown missing '45m' — output: %s\n" "$out"
+  printf "  \033[31m✗\033[0m Far-future reset should hide ↻ — output: %s\n" "$out"
 fi
 
 # --- Scenario 17f: Git cache isolation between repos ---
@@ -278,22 +269,58 @@ else
 fi
 rm -rf "$REPO_A" "$REPO_B"
 
-# --- Scenario 17c: Pace delta - on-pace hidden (< threshold) ---
-# 50% used with 2.5h elapsed → expected=50%, delta=0, should be hidden
-RESET_2_5H=$(($(date +%s) + 9000))
-run_test "Pace: on-pace hidden (|delta|<3)" "{
-  \"workspace\":{\"current_dir\":\"/tmp\"},
-  \"model\":{\"display_name\":\"Claude Opus 4.6\"},
-  \"rate_limits\":{\"five_hour\":{\"used_percentage\":50,\"resets_at\":${RESET_2_5H}}}
-}"
-out=$(echo "{\"workspace\":{\"current_dir\":\"/tmp\"},\"model\":{\"display_name\":\"Claude Opus 4.6\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":50,\"resets_at\":${RESET_2_5H}}}}" | bash "$SCRIPT" 2>/dev/null)
+# --- Scenario 17c: Bar renders fill + empty glyphs (currently braille ⡇/⡀) ---
+out=$(echo '{"model":{"display_name":"Claude Opus 4.7"},"context_window":{"used_percentage":40}}' | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
-if ! echo "$out" | grep -qE '⇡|⇣'; then
+if echo "$out" | grep -qF '⣿' && echo "$out" | grep -qF '⣀'; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Pace on-pace correctly hidden\n"
+  printf "  \033[32m✓\033[0m Bar renders braille blocks (⣿/⣀)\n"
 else
   FAIL=$((FAIL + 1))
-  printf "  \033[31m✗\033[0m Pace on-pace should have been hidden — output: %s\n" "$out"
+  printf "  \033[31m✗\033[0m Bar not using braille blocks — output: %s\n" "$out"
+fi
+
+# --- Scenario 17g: % renders to the LEFT of the bar ---
+# Layout #2: "glyph %used bar". Verify "40% ⣿" ordering (digits then a filled cell).
+out=$(echo '{"model":{"display_name":"Claude Opus 4.7"},"context_window":{"used_percentage":40}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qE '40% ⣿'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Percentage renders left of the bar (40%% ⣿)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Percentage not left of bar — output: %s\n" "$out"
+fi
+
+# --- Scenario 19: 7-day weekly window renders (⧖ + dated reset) ---
+RESET_7D=$(($(date +%s) + 4 * 86400))   # 4 days out → a different calendar date
+run_test "Weekly window renders (⧖ + dated reset)" "{
+  \"model\":{\"display_name\":\"Claude Opus 4.7\"},
+  \"rate_limits\":{\"five_hour\":{\"used_percentage\":40},\"seven_day\":{\"used_percentage\":38,\"resets_at\":${RESET_7D}}}
+}"
+out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":40},\"seven_day\":{\"used_percentage\":38,\"resets_at\":${RESET_7D}}}}" | bash "$SCRIPT" 2>/dev/null)
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⧖' && echo "$out" | grep -qE '↻[A-Z][a-z][a-z] +[0-9]'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Weekly renders ⧖ + month/day reset\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Weekly missing ⧖ or dated reset — output: %s\n" "$out"
+fi
+
+# --- Scenario 20: Weekly window absent → silently skipped (no ⧖, no --) ---
+run_test "Weekly absent (⧖ skipped)" '{
+  "model":{"display_name":"Claude Opus 4.7"},
+  "rate_limits":{"five_hour":{"used_percentage":40}}
+}'
+out=$(echo '{"model":{"display_name":"Claude Opus 4.7"},"rate_limits":{"five_hour":{"used_percentage":40}}}' | bash "$SCRIPT" 2>/dev/null)
+TOTAL=$((TOTAL + 1))
+if ! echo "$out" | grep -qF '⧖'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Weekly absent correctly skipped (no ⧖)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Weekly should be skipped when absent — output: %s\n" "$out"
 fi
 
 # --- Scenario 17: Rapid redraw (consistency) ---
@@ -346,6 +373,9 @@ echo ""
 echo '{"workspace":{"current_dir":"/Users/tedserbinski/Documents/projects/loretta"},"model":{"display_name":"Claude Sonnet 4.6"},"context_window":{"used_percentage":67},"cost":{"total_lines_added":200,"total_lines_removed":150},"rate_limits":{"five_hour":{"used_percentage":55}},"output_style":"Explanatory","session_name":"dev-session"}' | bash "$SCRIPT" 2>/dev/null
 echo ""
 echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 4.6"},"context_window":{"used_percentage":91},"rate_limits":{"five_hour":{"used_percentage":88}}}' | bash "$SCRIPT" 2>/dev/null
+echo ""
+# Both windows live: solid bars, % on the left, absolute reset times (session today, week dated)
+echo "{\"workspace\":{\"current_dir\":\"/Users/tedserbinski/Github/loretta\"},\"model\":{\"display_name\":\"Claude Opus 4.7 (1M context)\"},\"context_window\":{\"used_percentage\":74},\"rate_limits\":{\"five_hour\":{\"used_percentage\":84,\"resets_at\":$(($(date +%s)+10800))},\"seven_day\":{\"used_percentage\":38,\"resets_at\":$(($(date +%s)+5*86400))}}}" | bash "$SCRIPT" 2>/dev/null
 echo ""
 
 # --- Summary ---
