@@ -11,6 +11,7 @@ A compact, single-line statusline for [Claude Code](https://claude.com/claude-co
 - **Session ID auto-hide** — when a session is named (via `/rename`), the lavender `[id]` block is hidden since Claude Code already shows the name in its header. Only unnamed sessions show a truncated `[abc12345]` block as a reminder to name the session.
 - **Update-ready indicator** — a green refresh arrow (`↻`) appears next to the version number when a newer Claude Code is installed than the one currently running. Detected by reading the versioned symlink target, no subprocess spawn.
 - **Graceful degradation** — every element is conditional. If a field is missing from the input JSON (older Claude Code versions, pending data before the first API response, etc.), the section is silently skipped rather than showing `null` or `0`.
+- **Worktree-aware branch** — inside a linked git worktree, the branch element appends the worktree name with an `↳` marker (`⎇ feat ↳ wt-name`); the main checkout shows just `⎇ branch`. Detected from the worktree's git-dir, so it works however the worktree was created.
 - **Color-coded progress bars** — 10-cell braille blocks (`⣿⣀`) at 10% increments for context usage and both rate windows, with the percentage to the left: green under 50%, yellow 50–79%, red 80% and up. The gap-free fill mirrors Claude Code's own `/usage` bars.
 - **Both rate windows** — the 5-hour session window (`⏱`) and the 7-day weekly window (`⧖`) each get their own bar and reset time. Either window is rendered only when Claude Code sends it (they can be independently absent), so the weekly segment simply doesn't appear until there's data. Inspired by [claude-pace](https://github.com/Astro-Han/claude-pace).
 - **Absolute reset times** — each rate window shows *when* it resets, like the `/usage` view: `↻8:10pm` if it resets later today, `↻Jun 1` if it resets on another day. No pacing or projection math — just how much you've used and when it comes back.
@@ -28,6 +29,7 @@ From left to right, each element is separated by a dim `·`:
 | **Session ID** | `[abc12345]` | lavender | Only when session is unnamed. First 8 chars of the session UUID. |
 | **Directory** | `~/Documents/projects` | cyan | Home directory is abbreviated to `~`. |
 | **Git branch** | `⎇ main` | green | Only when inside a git repo. Falls back to short commit SHA if HEAD is detached. |
+| **Worktree** | `↳ wt-name` | lavender | Appended to the branch (`⎇ feat ↳ wt-name`) only when inside a *linked* git worktree. The name is the worktree's git-dir basename. |
 | **Lines changed** | `+35/-31` | green / red | Session total of lines added and removed by the model. |
 | **Model** | `◆ Opus 4.7 1M` | yellow | `Claude ` prefix stripped; `(1M context)` / `(200K context)` collapsed to a bare size token. |
 | **Context usage** | `⛁ 23% ⣿⣿⣀⣀⣀⣀⣀⣀⣀⣀` | green / yellow / red | Percent of the context window consumed by the current conversation, with a 10-cell bar. Shows `⛁ --` before the first API response. |
@@ -80,13 +82,13 @@ Restart Claude Code (or open a new session) and the statusline should appear at 
 
 ### Testing
 
-A test suite covering 33 checks (full payloads, boundary values, missing fields, model-name shortening, braille bars, absolute reset times, the weekly window, rapid redraws, performance) is included:
+A test suite covering 34 checks (full payloads, boundary values, missing fields, model-name shortening, braille bars, absolute reset times, the weekly window, worktree labelling, rapid redraws, performance) is included:
 
 ```sh
 bash ~/claude-statusline/test-statusline.sh
 ```
 
-Expected output ends with `All 33 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
+Expected output ends with `All 34 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
 
 ## Customization
 

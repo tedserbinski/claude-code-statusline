@@ -98,6 +98,7 @@ fi
 # Using parameter expansion (not shasum) keeps this subprocess-free.
 # Atomic write via mktemp+mv prevents partial reads on concurrent ticks.
 git_branch=""
+git_worktree=""
 if [ -n "$cwd" ]; then
   cache_file="${TMPDIR:-/tmp}/claude-sl-git${cwd//\//_}"
   cache_age=999999999
@@ -108,13 +109,18 @@ if [ -n "$cwd" ]; then
     if git -C "$cwd" rev-parse --git-dir > /dev/null 2>&1; then
       git_branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null \
         || git -C "$cwd" --no-optional-locks rev-parse --short HEAD 2>/dev/null)
+      # A linked worktree's git-dir is <repo>/.git/worktrees/<name>; the main worktree's isn't.
+      # Use that <name> as the worktree label so you can tell which checkout you're in.
+      gitdir=$(git -C "$cwd" --no-optional-locks rev-parse --absolute-git-dir 2>/dev/null)
+      case "$gitdir" in */worktrees/*) git_worktree="${gitdir##*/}" ;; esac
     fi
+    # Cache is tab-separated: "<branch>\t<worktree>" (worktree empty in the main checkout).
     tmp_cache=$(mktemp "${cache_file}.XXXXXX" 2>/dev/null)
     if [ -n "$tmp_cache" ]; then
-      printf '%s' "$git_branch" > "$tmp_cache" && mv "$tmp_cache" "$cache_file"
+      printf '%s\t%s' "$git_branch" "$git_worktree" > "$tmp_cache" && mv "$tmp_cache" "$cache_file"
     fi
   else
-    git_branch=$(cat "$cache_file" 2>/dev/null)
+    IFS=$'\t' read -r git_branch git_worktree < "$cache_file" 2>/dev/null
   fi
 fi
 
@@ -153,9 +159,13 @@ if [ -n "$cwd" ]; then
   parts+=("${C_CYAN}${cwd/#$HOME/~}${C_RESET}")
 fi
 
-# Git branch
+# Git branch (+ worktree label, with its own icon, when inside a linked worktree)
 if [ -n "$git_branch" ]; then
-  parts+=("${C_GREEN}⎇ ${git_branch}${C_RESET}")
+  if [ -n "$git_worktree" ]; then
+    parts+=("${C_GREEN}⎇ ${git_branch} ${C_LAVENDER}↳ ${git_worktree}${C_RESET}")
+  else
+    parts+=("${C_GREEN}⎇ ${git_branch}${C_RESET}")
+  fi
 fi
 
 # Lines changed

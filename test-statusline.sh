@@ -270,6 +270,27 @@ else
 fi
 rm -rf "$REPO_A" "$REPO_B"
 
+# --- Scenario 17i: Linked worktree labels the branch element (main checkout doesn't) ---
+WT_BASE=$(mktemp -d)
+WT_MAIN="$WT_BASE/repo"
+mkdir -p "$WT_MAIN"
+(git -C "$WT_MAIN" init -q -b main && git -C "$WT_MAIN" commit --allow-empty -q -m init) 2>/dev/null
+git -C "$WT_MAIN" worktree add -q "$WT_BASE/repo-wt" -b wt-branch >/dev/null 2>&1
+out_main=$(echo "{\"workspace\":{\"current_dir\":\"$WT_MAIN\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+out_wt=$(echo "{\"workspace\":{\"current_dir\":\"$WT_BASE/repo-wt\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+# Icon-agnostic: in the worktree the branch element carries both the branch and the worktree
+# name ("wt-branch" then "repo-wt"); the main checkout shows no worktree label.
+if echo "$out_wt" | grep -qE 'wt-branch.*repo-wt' && ! echo "$out_main" | grep -qF 'repo-wt'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Linked worktree labels the branch element\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Worktree label wrong — wt:%s main:%s\n" "$out_wt" "$out_main"
+fi
+git -C "$WT_MAIN" worktree remove --force "$WT_BASE/repo-wt" 2>/dev/null
+rm -rf "$WT_BASE"
+
 # --- Scenario 17c: Bar renders fill + empty glyphs (currently braille ⡇/⡀) ---
 out=$(echo '{"model":{"display_name":"Claude Opus 4.7"},"context_window":{"used_percentage":40}}' | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
