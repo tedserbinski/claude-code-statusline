@@ -198,22 +198,23 @@ run_test "No context/rate data (-- indicators)" '{
   "model":{"display_name":"Claude Opus 4.6"}
 }'
 
-# --- Scenario 17a: Reset renders as an absolute time (clock today, or a date) ---
-RESET_SOON=$(($(date +%s) + 600))
-run_test "Reset: absolute time renders" "{
+# --- Scenario 17a: 5-hour reset renders as a CLOCK TIME (never a date) ---
+# A 5h-window reset is always <24h away, so it must show the time — even when it crosses midnight.
+# Regression: a 1am-tomorrow reset must read "1:10am", not the calendar date "May 27".
+RESET_SOON=$(($(date +%s) + 14400))   # 4h out — frequently lands after midnight
+run_test "Reset: 5h shows clock time" "{
   \"workspace\":{\"current_dir\":\"/tmp\"},
   \"model\":{\"display_name\":\"Claude Opus 4.7\"},
   \"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":${RESET_SOON}}}
 }"
 out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":${RESET_SOON}}}}" | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
-# Must show ↻ + a valid format: clock time (8:10pm) today, or month/day if it rolled past midnight.
-if echo "$out" | grep -qE '↻([0-9]{1,2}:[0-9]{2}(am|pm)|[A-Z][a-z][a-z] +[0-9]{1,2})'; then
+if echo "$out" | grep -qE '↻[0-9]{1,2}:[0-9]{2}(am|pm)' && ! echo "$out" | grep -qE '↻[A-Z][a-z][a-z] +[0-9]'; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Reset renders as an absolute time\n"
+  printf "  \033[32m✓\033[0m 5h reset renders a clock time (not a date)\n"
 else
   FAIL=$((FAIL + 1))
-  printf "  \033[31m✗\033[0m Reset not a valid absolute time — output: %s\n" "$out"
+  printf "  \033[31m✗\033[0m 5h reset should be a clock time — output: %s\n" "$out"
 fi
 
 # --- Scenario 17b: No pacing glyphs, even at high usage ---

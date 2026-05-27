@@ -42,8 +42,8 @@ pct_color_val() {
 # --- Rate-limit segment builder ---
 # Renders one rate window the way Claude Code's own /usage view does: glyph + bar + used% + the
 # absolute time the window resets. No pacing/projection — just "how much used, and when it resets".
-#   ↻8:10pm = resets later today at that clock time.
-#   ↻Jun 1  = resets on that date (shown when the reset isn't today). Result in _rate_segment.
+#   ↻1:10am = resets within a day, shown as the clock time (even when it's after midnight).
+#   ↻Jun 1  = resets further out — shown as month/day (the weekly window). Result in _rate_segment.
 build_rate_segment() {
   local used_raw="$1" reset_ts="$2" window="$3" glyph="$4"
   local u_int; printf -v u_int "%.0f" "$used_raw" 2>/dev/null
@@ -51,16 +51,16 @@ build_rate_segment() {
   pct_color_val "$u_int"
   local reset=""
   if [[ "$reset_ts" =~ ^[0-9]+$ ]] && (( reset_ts > 0 )); then
-    # One `date` reads now+today; another formats the reset. Trust the reset only when it's in
-    # the future and no further out than the window itself (guards stale/garbage timestamps).
-    local now_today; now_today=$(date '+%s|%F')
-    local now="${now_today%%|*}" today="${now_today#*|}"
+    # Trust the reset only when it's in the future and no further out than the window itself
+    # (guards stale/garbage timestamps).
+    local now; now=$(date +%s)
     if (( reset_ts > now && reset_ts - now <= window )); then
-      # %F=date (same-day check), %l:%M%p=clock time, %b %e=month/day — formatted in one call.
-      local fmt; fmt=$(date -r "$reset_ts" '+%F|%l:%M%p|%b %e')
-      local r_day="${fmt%%|*}" rest="${fmt#*|}"
+      # Within 24h → clock time (%l:%M%p), even across midnight; further out → month/day (%b %e).
+      # The choice is by time-to-reset, NOT calendar date — a 5h window resetting at 1am tomorrow
+      # should read "1:10am", not "May 27". Both formats produced in one `date` call.
+      local fmt; fmt=$(date -r "$reset_ts" '+%l:%M%p|%b %e')
       local r
-      if [ "$today" = "$r_day" ]; then r="${rest%%|*}"; else r="${rest#*|}"; fi
+      if (( reset_ts - now <= 86400 )); then r="${fmt%%|*}"; else r="${fmt#*|}"; fi
       r="${r//  / }"; r="${r# }"; r="${r//AM/am}"; r="${r//PM/pm}"   # "  8:10PM" → "8:10pm"
       reset=" ${C_GREY}↻${r}${C_RESET}"
     fi
