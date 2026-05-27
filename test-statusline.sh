@@ -293,6 +293,17 @@ else
   printf "  \033[31m✗\033[0m Percentage not left of bar — output: %s\n" "$out"
 fi
 
+# --- Scenario 17h: Model name shortening (strip "Claude", compact "(1M context)") ---
+out=$(echo '{"model":{"display_name":"Claude Opus 4.7 (1M context)"}}' | bash "$SCRIPT" 2>/dev/null)
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF 'Opus 4.7 1M' && ! echo "$out" | grep -qF 'context'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Model name shortened (Opus 4.7 1M)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Model name not shortened — output: %s\n" "$out"
+fi
+
 # --- Scenario 19: 7-day weekly window renders (⧖ + dated reset) ---
 RESET_7D=$(($(date +%s) + 4 * 86400))   # 4 days out → a different calendar date
 run_test "Weekly window renders (⧖ + dated reset)" "{

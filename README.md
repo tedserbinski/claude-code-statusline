@@ -14,6 +14,7 @@ A compact, single-line statusline for [Claude Code](https://claude.com/claude-co
 - **Color-coded progress bars** — 10-cell braille blocks (`⣿⣀`) at 10% increments for context usage and both rate windows, with the percentage to the left: green under 50%, yellow 50–79%, red 80% and up. The gap-free fill mirrors Claude Code's own `/usage` bars.
 - **Both rate windows** — the 5-hour session window (`⏱`) and the 7-day weekly window (`⧖`) each get their own bar and reset time. Either window is rendered only when Claude Code sends it (they can be independently absent), so the weekly segment simply doesn't appear until there's data. Inspired by [claude-pace](https://github.com/Astro-Han/claude-pace).
 - **Absolute reset times** — each rate window shows *when* it resets, like the `/usage` view: `↻8:10pm` if it resets later today, `↻Jun 1` if it resets on another day. No pacing or projection math — just how much you've used and when it comes back.
+- **Compact model name** — strips the `Claude ` prefix and collapses any `(1M context)` / `(200K context)` annotation to a bare size token, so `Claude Opus 4.7 (1M context)` shows as `Opus 4.7 1M` and `Claude Sonnet 4.6` as `Sonnet 4.6`.
 - **Single-pass jq extraction** — one `jq` invocation pulls all fields, avoiding the ~20-process fan-out of naive scripts.
 - **Cached git branch** — 5-second TTL so `git symbolic-ref` doesn't run on every statusline tick.
 - **Terminal-safe output** — leading and trailing ANSI resets prevent color bleed into surrounding content, no trailing newline (Claude Code counts newlines to determine row count).
@@ -28,7 +29,7 @@ From left to right, each element is separated by a dim `·`:
 | **Directory** | `~/Documents/projects` | cyan | Home directory is abbreviated to `~`. |
 | **Git branch** | `⎇ main` | green | Only when inside a git repo. Falls back to short commit SHA if HEAD is detached. |
 | **Lines changed** | `+35/-31` | green / red | Session total of lines added and removed by the model. |
-| **Model** | `◆ Opus 4.6` | yellow | `Claude` prefix is stripped for compactness. |
+| **Model** | `◆ Opus 4.7 1M` | yellow | `Claude ` prefix stripped; `(1M context)` / `(200K context)` collapsed to a bare size token. |
 | **Context usage** | `⛁ 23% ⣿⣿⣀⣀⣀⣀⣀⣀⣀⣀` | green / yellow / red | Percent of the context window consumed by the current conversation, with a 10-cell bar. Shows `⛁ --` before the first API response. |
 | **5-hour window** | `⏱ 74% ⣿⣿⣿⣿⣿⣿⣿⣀⣀⣀ ↻8:10pm` | green / yellow / red | Percent of the 5-hour rate limit used. Claude Pro/Max only. Shows `⏱ --` before the first API response. Appends the reset time when `resets_at` is present — see below. |
 | **7-day window** | `⧖ 36% ⣿⣿⣿⣿⣀⣀⣀⣀⣀⣀ ↻Jun 1` | green / yellow / red | Percent of the 7-day (weekly) rate limit used, read from `rate_limits.seven_day`. Same bar and reset time as the 5-hour window, distinguished by the `⧖` glyph. Silently skipped when the weekly window is absent from the payload. |
@@ -79,13 +80,13 @@ Restart Claude Code (or open a new session) and the statusline should appear at 
 
 ### Testing
 
-A test suite covering 32 checks (full payloads, boundary values, missing fields, braille bars, absolute reset times, the weekly window, rapid redraws, performance) is included:
+A test suite covering 33 checks (full payloads, boundary values, missing fields, model-name shortening, braille bars, absolute reset times, the weekly window, rapid redraws, performance) is included:
 
 ```sh
 bash ~/claude-statusline/test-statusline.sh
 ```
 
-Expected output ends with `All 32 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
+Expected output ends with `All 33 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
 
 ## Customization
 

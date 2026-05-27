@@ -87,6 +87,11 @@ eval "$(echo "$input" | jq -r '
   @sh "cc_version=\(.version // "")"
 ')"
 model="${model#Claude }"
+# Compact any "(1M context)" / "(200K context)" annotation to just the size token, so every
+# model name stays short regardless of tier: "Opus 4.7 (1M context)" → "Opus 4.7 1M".
+if [[ "$model" =~ ^(.+)\ \(([0-9]+[KMkm])\ context\)$ ]]; then
+  model="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+fi
 
 # --- Git branch (cached for 5 seconds to avoid slow git calls) ---
 # Cache key includes cwd so concurrent sessions in different repos don't clash.
