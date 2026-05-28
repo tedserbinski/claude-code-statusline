@@ -9,12 +9,13 @@
 input=$(cat)
 
 # --- ANSI colors ---
-C_CYAN="\033[36m"
 C_GREEN="\033[32m"
 C_YELLOW="\033[33m"
 C_RED="\033[31m"
 C_GREY="\033[38;5;245m"
 C_LAVENDER="\033[38;5;147m"
+C_BLUE="\033[38;5;75m"
+C_SEAGREEN="\033[38;5;78m"
 C_DIM_WHITE="\033[38;5;250m"
 C_RESET="\033[0m"
 
@@ -154,18 +155,30 @@ if [ -z "$session_name" ]; then
   fi
 fi
 
-# Directory
+# Location: directory + worktree label + git branch as ONE segment, joined by plain spaces
+# (no " · " between them — they're a single "where am I" group). The join loop only inserts
+# " · " *between* parts, so keeping these in one array slot suppresses the dot here while
+# preserving it before the segments that follow.
+location=""
 if [ -n "$cwd" ]; then
-  parts+=("${C_CYAN}${cwd/#$HOME/~}${C_RESET}")
-fi
-
-# Git branch (+ worktree label, with its own icon, when inside a linked worktree)
-if [ -n "$git_branch" ]; then
+  display_dir="${cwd/#$HOME/~}"
+  # Worktrees live at <repo>/.claude/worktrees/<name>. Collapse that whole tail back to the
+  # repo root, then tag on a "↳ <name>" label so the worktree is named without the long path.
+  display_dir="${display_dir%%/.claude/worktrees/*}"
+  location="${C_YELLOW}${display_dir}${C_RESET}"
   if [ -n "$git_worktree" ]; then
-    parts+=("${C_GREEN}⎇ ${git_branch} ${C_LAVENDER}↳ ${git_worktree}${C_RESET}")
-  else
-    parts+=("${C_GREEN}⎇ ${git_branch}${C_RESET}")
+    location="${location} ${C_SEAGREEN}↳ ${git_worktree}${C_RESET}"
   fi
+fi
+if [ -n "$git_branch" ]; then
+  if [ -n "$location" ]; then
+    location="${location} ${C_BLUE}⎇ ${git_branch}${C_RESET}"
+  else
+    location="${C_BLUE}⎇ ${git_branch}${C_RESET}"
+  fi
+fi
+if [ -n "$location" ]; then
+  parts+=("$location")
 fi
 
 # Lines changed
