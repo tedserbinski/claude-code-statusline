@@ -161,7 +161,15 @@ fi
 # preserving it before the segments that follow.
 location=""
 if [ -n "$cwd" ]; then
-  display_dir="${cwd/#$HOME/~}"
+  # Collapse a leading $HOME to ~. Done as prefix-strip (#) + quoted "~" rather than a /#/
+  # pattern substitution: bash 5.2+ tilde-expands a ~ in a substitution's replacement string
+  # (turning it back into $HOME → no-op, full path leaks), while bash 3.2 leaves a \~ literal.
+  # ${cwd#$HOME} behaves identically across versions, and ~ inside double quotes is never expanded.
+  if [ "$cwd" = "$HOME" ] || [ "${cwd#"$HOME"/}" != "$cwd" ]; then
+    display_dir="~${cwd#"$HOME"}"
+  else
+    display_dir="$cwd"
+  fi
   # Worktrees live at <repo>/.claude/worktrees/<name>. Collapse that whole tail back to the
   # repo root, then tag on a "↳ <name>" label so the worktree is named without the long path.
   display_dir="${display_dir%%/.claude/worktrees/*}"
