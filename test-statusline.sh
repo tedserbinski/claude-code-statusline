@@ -293,6 +293,56 @@ fi
 git -C "$WT_MAIN" worktree remove --force "$WT_BASE/repo-wt" 2>/dev/null
 rm -rf "$WT_BASE"
 
+# --- Scenario 17i2: Worktree label uses the checkout dir name, not git's internal id ---
+# git's internal worktree id (.git/worktrees/<id>) is a sanitized/deduped basename and can degrade
+# to a bare "0", "-", etc. The label must come from the real checkout directory, never that id.
+WT2_BASE=$(mktemp -d)
+WT2_MAIN="$WT2_BASE/repo"
+mkdir -p "$WT2_MAIN"
+(git -C "$WT2_MAIN" init -q -b main && git -C "$WT2_MAIN" commit --allow-empty -q -m init) 2>/dev/null
+# Force a degenerate internal id: a checkout whose basename sanitizes to a non-name, so git stores
+# it under .git/worktrees/ as something like "-" rather than the directory's real name.
+git -C "$WT2_MAIN" worktree add -q "$WT2_BASE/.#" -b odd-branch >/dev/null 2>&1
+wt2_id=$(git -C "$WT2_BASE/.#" rev-parse --absolute-git-dir 2>/dev/null | sed 's#.*/##')
+out_wt2=$(echo "{\"workspace\":{\"current_dir\":\"$WT2_BASE/.#\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+# The bare internal id (e.g. "-") must NOT appear as the standalone "↳ <id>" label; the branch must.
+if echo "$out_wt2" | grep -qF 'odd-branch' && ! echo "$out_wt2" | grep -qF "↳ ${wt2_id} "; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Worktree label uses checkout dir name, not git's internal id\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Worktree label leaked internal id '%s' — wt:%s\n" "$wt2_id" "$out_wt2"
+fi
+git -C "$WT2_MAIN" worktree remove --force "$WT2_BASE/.#" 2>/dev/null
+rm -rf "$WT2_BASE"
+
+# --- Scenario 17i3: Cached render with empty worktree field doesn't leak the line count ---
+# The git cache stores "<branch><sep><worktree><sep><added><sep><removed>". On a main checkout the
+# worktree field is EMPTY; if the separator were IFS-whitespace, `read` would collapse the empty
+# field on the cache-HIT path and slide <added> into the worktree slot (a bogus "↳ 35"). Exercise
+# the cache by rendering the SAME cwd twice in quick succession (2nd read comes from cache) with a
+# tree that has line changes, and assert no spurious "↳ <number>" label appears.
+CACHE_REPO=$(mktemp -d)
+(
+  cd "$CACHE_REPO" || exit
+  git init -q -b main && git config user.email t@t.com && git config user.name t
+  printf 'a\nb\nc\n' > f.txt && git add . && git commit -qm init
+  printf 'a\nb\nc\nd\ne\n' > f.txt           # +2 uncommitted changes → non-empty +N/-N
+) 2>/dev/null
+in_json="{\"workspace\":{\"current_dir\":\"$CACHE_REPO\"},\"model\":{\"display_name\":\"x\"}}"
+echo "$in_json" | bash "$SCRIPT" >/dev/null 2>&1   # 1st: populates cache
+out_cached=$(echo "$in_json" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')  # 2nd: cache hit
+TOTAL=$((TOTAL + 1))
+if echo "$out_cached" | grep -qF '+2' && ! echo "$out_cached" | grep -qE '↳ [0-9]'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Cached render with empty worktree field keeps the line count out of the ↳ slot\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Cache roundtrip leaked line count into worktree label — %s\n" "$out_cached"
+fi
+rm -rf "$CACHE_REPO"
+
 # --- Scenario 17j: +N/-N counts real git lines since the fork (committed + staged + unstaged) ---
 # The segment must reflect actual .git state vs the branch's merge-base, NOT session telemetry.
 # Build a branch off main with a committed change, a staged + an unstaged edit, plus an untracked

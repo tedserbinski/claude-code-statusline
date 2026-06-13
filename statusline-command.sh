@@ -110,10 +110,18 @@ if [ -n "$cwd" ]; then
     if git -C "$cwd" rev-parse --git-dir > /dev/null 2>&1; then
       git_branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null \
         || git -C "$cwd" --no-optional-locks rev-parse --short HEAD 2>/dev/null)
-      # A linked worktree's git-dir is <repo>/.git/worktrees/<name>; the main worktree's isn't.
-      # Use that <name> as the worktree label so you can tell which checkout you're in.
+      # A linked worktree's git-dir is <repo>/.git/worktrees/<id>; the main worktree's isn't —
+      # use that to detect "am I in a linked worktree?". But DON'T label with git's internal <id>:
+      # git derives it by sanitizing/deduplicating the checkout basename, so it can degrade to a
+      # bare "0", "-", "1", etc. on collision or special characters. Label with the checkout
+      # directory's own name (via --show-toplevel) — the name the user actually recognizes.
       gitdir=$(git -C "$cwd" --no-optional-locks rev-parse --absolute-git-dir 2>/dev/null)
-      case "$gitdir" in */worktrees/*) git_worktree="${gitdir##*/}" ;; esac
+      case "$gitdir" in
+        */worktrees/*)
+          wt_toplevel=$(git -C "$cwd" --no-optional-locks rev-parse --show-toplevel 2>/dev/null)
+          git_worktree="${wt_toplevel##*/}"
+          ;;
+      esac
 
       # Lines changed in THIS branch/worktree since it forked off the mainline: every line that
       # differs from the fork point (merge-base), committed AND uncommitted. We diff the working
@@ -139,15 +147,20 @@ if [ -n "$cwd" ]; then
         | awk '{ if ($1 != "-") a += $1; if ($2 != "-") r += $2 } END { printf "%d\t%d", a, r }')
       IFS=$'\t' read -r git_added git_removed <<< "$git_stats"
     fi
-    # Cache is tab-separated: "<branch>\t<worktree>\t<added>\t<removed>" (worktree empty in the
-    # main checkout; added/removed empty outside a git repo).
+    # Cache fields are separated by the ASCII Unit Separator (\037): "<branch>\037<worktree>\037
+    # <added>\037<removed>" (worktree empty in the main checkout; added/removed empty outside a git
+    # repo). It must NOT be tab/space/newline: those are IFS-whitespace, and `read` collapses runs
+    # of IFS-whitespace into a single delimiter — so an empty worktree field (the common case) would
+    # vanish and shift <added> into the worktree slot (rendering a bogus "↳ 35"). \037 is a
+    # non-whitespace delimiter that read keeps as a literal field boundary, preserving empties, and
+    # it can never occur in a branch name, path, or count.
     tmp_cache=$(mktemp "${cache_file}.XXXXXX" 2>/dev/null)
     if [ -n "$tmp_cache" ]; then
-      printf '%s\t%s\t%s\t%s' "$git_branch" "$git_worktree" "$git_added" "$git_removed" > "$tmp_cache" \
+      printf '%s\037%s\037%s\037%s' "$git_branch" "$git_worktree" "$git_added" "$git_removed" > "$tmp_cache" \
         && mv "$tmp_cache" "$cache_file"
     fi
   else
-    IFS=$'\t' read -r git_branch git_worktree git_added git_removed < "$cache_file" 2>/dev/null
+    IFS=$'\037' read -r git_branch git_worktree git_added git_removed < "$cache_file" 2>/dev/null
   fi
 fi
 
