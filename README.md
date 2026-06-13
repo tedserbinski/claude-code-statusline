@@ -30,7 +30,7 @@ From left to right, each element is separated by a dim `·`:
 | **Directory** | `~/Documents/projects` | cyan | Home directory is abbreviated to `~`. |
 | **Git branch** | `⎇ main` | green | Only when inside a git repo. Falls back to short commit SHA if HEAD is detached. |
 | **Worktree** | `↳ wt-name` | lavender | Appended to the branch (`⎇ feat ↳ wt-name`) only when inside a *linked* git worktree. The name is the worktree's git-dir basename. |
-| **Lines changed** | `+35/-31` | green / red | Session total of lines added and removed by the model. |
+| **Lines changed** | `+35/-31` | green / red | Real `git diff` of the current branch/worktree against its fork point — every tracked line **added/removed since the branch diverged from the mainline**, counting committed, staged, and unstaged edits together. The fork point is the merge-base with the first of `main`, `master`, `origin/HEAD`, `origin/main`, or `origin/master` that shares history (so a feature branch shows all its work, and `main` itself shows just uncommitted changes). Untracked files are excluded, and the whole segment is hidden when the tree is clean. Computed inside the 5-second git cache, so no extra cost per tick. |
 | **Model** | `◆ Opus 4.7 1M` | yellow | `Claude ` prefix stripped; `(1M context)` / `(200K context)` collapsed to a bare size token. |
 | **Context usage** | `⛁ 23% ⣿⣿⣀⣀⣀⣀⣀⣀⣀⣀` | green / yellow / red | Percent of the context window consumed by the current conversation, with a 10-cell bar. Shows `⛁ --` before the first API response. |
 | **5-hour window** | `⏱ 74% ⣿⣿⣿⣿⣿⣿⣿⣀⣀⣀ ↻8:10pm` | green / yellow / red | Percent of the 5-hour rate limit used. Claude Pro/Max only. Shows `⏱ --` before the first API response. Appends the reset time when `resets_at` is present — see below. |
@@ -88,7 +88,7 @@ A test suite covering 34 checks (full payloads, boundary values, missing fields,
 bash ~/claude-statusline/test-statusline.sh
 ```
 
-Expected output ends with `All 34 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
+Expected output ends with `All 36 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
 
 ## Customization
 
