@@ -279,9 +279,11 @@ git -C "$WT_MAIN" worktree add -q "$WT_BASE/repo-wt" -b wt-branch >/dev/null 2>&
 out_main=$(echo "{\"workspace\":{\"current_dir\":\"$WT_MAIN\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 out_wt=$(echo "{\"workspace\":{\"current_dir\":\"$WT_BASE/repo-wt\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 TOTAL=$((TOTAL + 1))
-# Icon-agnostic: in the worktree the branch element carries both the branch and the worktree
-# name ("wt-branch" then "repo-wt"); the main checkout shows no worktree label.
-if echo "$out_wt" | grep -qE 'wt-branch.*repo-wt' && ! echo "$out_main" | grep -qF 'repo-wt'; then
+# Icon-agnostic: in the worktree the location segment carries BOTH the worktree name (as the
+# directory tail and again as the "↳ <name>" label → repo-wt appears twice) and the branch
+# ("wt-branch"); the main checkout has no worktree label so "repo-wt" never appears there.
+wt_label_count=$(echo "$out_wt" | grep -oF 'repo-wt' | wc -l | tr -d ' ')
+if [ "$wt_label_count" -ge 2 ] && echo "$out_wt" | grep -qF 'wt-branch' && ! echo "$out_main" | grep -qF 'repo-wt'; then
   PASS=$((PASS + 1))
   printf "  \033[32m✓\033[0m Linked worktree labels the branch element\n"
 else
@@ -290,6 +292,55 @@ else
 fi
 git -C "$WT_MAIN" worktree remove --force "$WT_BASE/repo-wt" 2>/dev/null
 rm -rf "$WT_BASE"
+
+# --- Scenario 17j: +N/-N counts real git lines since the fork (committed + staged + unstaged) ---
+# The segment must reflect actual .git state vs the branch's merge-base, NOT session telemetry.
+# Build a branch off main with a committed change, a staged + an unstaged edit, plus an untracked
+# file and a .gitignored file — both of which must be EXCLUDED. Hand-computed truth = +5/-1.
+LR_BASE=$(mktemp -d)
+(
+  cd "$LR_BASE" || exit
+  git init -q -b main && git config user.email t@t.com && git config user.name t
+  printf 'a\nb\nc\n' > base.txt && git add . && git commit -qm init
+  git checkout -qb feature
+  printf 'a\nB-CHANGED\nc\nd\ne\n' > base.txt && git commit -qam c1          # committed +2/-1
+  printf 'a\nB-CHANGED\nc\nd\ne\nf\n' > base.txt && git add base.txt          # staged +1
+  printf 'a\nB-CHANGED\nc\nd\ne\nf\ng\n' > base.txt                           # unstaged +1
+  printf 'n1\nn2\nn3\n' > untracked.txt                                       # untracked — excluded
+  printf 'ignored.txt\n' > .gitignore && printf 'x\ny\n' > ignored.txt        # untracked/ignored — excluded
+) >/dev/null 2>&1
+# base.txt vs fork: added B-CHANGED,d,e,f,g = +5, removed b = -1. untracked.txt, .gitignore and
+# ignored.txt are all untracked and therefore NOT counted. Total = +5 / -1.
+rm -f "${TMPDIR:-/tmp}/claude-sl-git${LR_BASE//\//_}" 2>/dev/null
+out_lr=$(echo "{\"workspace\":{\"current_dir\":\"$LR_BASE\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out_lr" | grep -qF '+5/-1'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m +N/-N counts tracked git lines since fork (untracked excluded)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Lines-since-fork wrong — expected +5/-1 in: %s\n" "$out_lr"
+fi
+rm -rf "$LR_BASE"
+
+# --- Scenario 17k: clean tree (no changes since fork) hides the +N/-N segment ---
+CL_BASE=$(mktemp -d)
+(
+  cd "$CL_BASE" || exit
+  git init -q -b main && git config user.email t@t.com && git config user.name t
+  printf 'a\nb\n' > f.txt && git add . && git commit -qm init
+) >/dev/null 2>&1
+rm -f "${TMPDIR:-/tmp}/claude-sl-git${CL_BASE//\//_}" 2>/dev/null
+out_cl=$(echo "{\"workspace\":{\"current_dir\":\"$CL_BASE\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if ! echo "$out_cl" | grep -qE '\+[0-9]+/-[0-9]+'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Clean tree hides +N/-N segment\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Clean tree should hide +N/-N — got: %s\n" "$out_cl"
+fi
+rm -rf "$CL_BASE"
 
 # --- Scenario 17c: Bar renders fill + empty glyphs (currently braille ⡇/⡀) ---
 out=$(echo '{"model":{"display_name":"Claude Opus 4.7"},"context_window":{"used_percentage":40}}' | bash "$SCRIPT" 2>/dev/null)

@@ -74,8 +74,6 @@ eval "$(echo "$input" | jq -r '
   @sh "cwd=\(.workspace.current_dir // .cwd // "")",
   @sh "model=\(.model.display_name // "")",
   @sh "ctx_pct=\(.context_window.used_percentage // "")",
-  @sh "lines_added=\(.cost.total_lines_added // "")",
-  @sh "lines_removed=\(.cost.total_lines_removed // "")",
   @sh "output_style=\((.output_style | if type == "object" then .name // "" else . // "" end))",
   @sh "vim_mode=\(.vim.mode // "")",
   @sh "session_name=\(.session_name // "")",
@@ -100,6 +98,8 @@ fi
 # Atomic write via mktemp+mv prevents partial reads on concurrent ticks.
 git_branch=""
 git_worktree=""
+git_added=""
+git_removed=""
 if [ -n "$cwd" ]; then
   cache_file="${TMPDIR:-/tmp}/claude-sl-git${cwd//\//_}"
   cache_age=999999999
@@ -114,14 +114,40 @@ if [ -n "$cwd" ]; then
       # Use that <name> as the worktree label so you can tell which checkout you're in.
       gitdir=$(git -C "$cwd" --no-optional-locks rev-parse --absolute-git-dir 2>/dev/null)
       case "$gitdir" in */worktrees/*) git_worktree="${gitdir##*/}" ;; esac
+
+      # Lines changed in THIS branch/worktree since it forked off the mainline: every line that
+      # differs from the fork point (merge-base), committed AND uncommitted. We diff the working
+      # tree against the merge-base commit (two-dot, not three-dot commit..commit) so staged +
+      # unstaged edits to tracked files count alongside committed ones. Brand-new UNTRACKED files
+      # are intentionally excluded — they'd otherwise pull in generated, non-gitignored dirs
+      # (build output, tool indexes) and inflate the count; a new file lands here once you stage it.
+      #
+      # Pick the fork point against the first mainline ref that actually exists and shares history:
+      # prefer the LOCAL main/master (what you branched from, and kept current), then the remote
+      # equivalents for a fresh clone/worktree that has no local mainline yet. If none yield a
+      # merge-base — e.g. you ARE on main, or an orphan branch — fall back to HEAD, which collapses
+      # the diff to "uncommitted changes only".
+      diff_base="HEAD"
+      for cand in main master origin/HEAD origin/main origin/master; do
+        git -C "$cwd" --no-optional-locks rev-parse --verify --quiet "${cand}^{commit}" >/dev/null 2>&1 || continue
+        mb=$(git -C "$cwd" --no-optional-locks merge-base HEAD "$cand" 2>/dev/null)
+        if [ -n "$mb" ]; then diff_base="$mb"; break; fi
+      done
+      # numstat columns are <added>\t<removed>\t<path>; binary files report "-" for both, so skip
+      # those rather than summing a literal dash.
+      git_stats=$(git -C "$cwd" --no-optional-locks diff --numstat "$diff_base" 2>/dev/null \
+        | awk '{ if ($1 != "-") a += $1; if ($2 != "-") r += $2 } END { printf "%d\t%d", a, r }')
+      IFS=$'\t' read -r git_added git_removed <<< "$git_stats"
     fi
-    # Cache is tab-separated: "<branch>\t<worktree>" (worktree empty in the main checkout).
+    # Cache is tab-separated: "<branch>\t<worktree>\t<added>\t<removed>" (worktree empty in the
+    # main checkout; added/removed empty outside a git repo).
     tmp_cache=$(mktemp "${cache_file}.XXXXXX" 2>/dev/null)
     if [ -n "$tmp_cache" ]; then
-      printf '%s\t%s' "$git_branch" "$git_worktree" > "$tmp_cache" && mv "$tmp_cache" "$cache_file"
+      printf '%s\t%s\t%s\t%s' "$git_branch" "$git_worktree" "$git_added" "$git_removed" > "$tmp_cache" \
+        && mv "$tmp_cache" "$cache_file"
     fi
   else
-    IFS=$'\t' read -r git_branch git_worktree < "$cache_file" 2>/dev/null
+    IFS=$'\t' read -r git_branch git_worktree git_added git_removed < "$cache_file" 2>/dev/null
   fi
 fi
 
@@ -189,9 +215,10 @@ if [ -n "$location" ]; then
   parts+=("$location")
 fi
 
-# Lines changed
-if [ -n "$lines_added" ] || [ -n "$lines_removed" ]; then
-  parts+=("${C_GREEN}+${lines_added:-0}${C_RESET}/${C_RED}-${lines_removed:-0}${C_RESET}")
+# Lines changed (real git diff vs the branch's fork point — committed + uncommitted).
+# Hidden on a clean tree so +0/-0 never adds noise.
+if [ "${git_added:-0}" != "0" ] || [ "${git_removed:-0}" != "0" ]; then
+  parts+=("${C_GREEN}+${git_added:-0}${C_RESET}/${C_RED}-${git_removed:-0}${C_RESET}")
 fi
 
 # Model
