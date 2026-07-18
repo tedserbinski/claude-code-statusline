@@ -48,6 +48,11 @@ pct_color_val() {
 build_rate_segment() {
   local used_raw="$1" reset_ts="$2" window="$3" glyph="$4"
   local u_int; printf -v u_int "%.0f" "$used_raw" 2>/dev/null
+  # Clamp to 0–100: the API can report fractionally over 100 when a window is fully spent
+  # (e.g. 100.6 → "101%"), and a bar/percentage past 100 reads as a bug, not a state.
+  u_int=${u_int:-0}
+  (( u_int < 0 )) && u_int=0
+  (( u_int > 100 )) && u_int=100
   build_bar "$u_int"
   pct_color_val "$u_int"
   local reset=""
@@ -90,6 +95,70 @@ model="${model#Claude }"
 # model name stays short regardless of tier: "Opus 4.7 (1M context)" → "Opus 4.7 1M".
 if [[ "$model" =~ ^(.+)\ \(([0-9]+[KMkm])\ context\)$ ]]; then
   model="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+fi
+
+# --- Rate-limit sync across sessions (login/logout, concurrent sessions) ---
+# Claude Code only refreshes rate_limits after an API call, so any one session's payload can be
+# stale in two ways: a brand-new session (or fresh login) has no rate_limits at all until its first
+# response, and an idle session keeps reporting a window that already reset — including a pegged
+# "100% used" long after the limit came back. Fix both with a tiny shared snapshot file: every
+# session publishes the freshest rate data it has seen, and every render uses whichever snapshot
+# (this payload vs the shared file) is genuinely fresher. Freshness rules, per window:
+#   1. an unexpired snapshot beats an expired one (expired = resets_at in the past)
+#   2. a later resets_at beats an earlier one (it's a newer window)
+#   3. same real window (equal resets_at) → the higher used% is newer (usage only grows)
+# If the winner is itself expired, the window has rolled over: usage renders as 0% with no ↻,
+# because the next window's anchor is unknown until the next API response.
+# CLAUDE_SL_CACHE_DIR overrides the location (used by the test suite for isolation).
+rate_cache="${CLAUDE_SL_CACHE_DIR:-${TMPDIR:-/tmp}}/claude-sl-rate"
+now_ts=$(date +%s)
+
+# args: pct_a reset_a pct_b reset_b — leaves the fresher snapshot in _w_pct/_w_reset
+pick_window() {
+  local pa="$1" ra="$2" pb="$3" rb="$4"
+  [[ "$ra" =~ ^[0-9]+$ ]] || ra=0
+  [[ "$rb" =~ ^[0-9]+$ ]] || rb=0
+  local ia=0 ib=0
+  printf -v ia "%.0f" "${pa:-0}" 2>/dev/null
+  printf -v ib "%.0f" "${pb:-0}" 2>/dev/null
+  local ea=0 eb=0
+  (( ra > 0 && ra <= now_ts )) && ea=1
+  (( rb > 0 && rb <= now_ts )) && eb=1
+  _w_pct="$pa"; _w_reset="$ra"
+  if [ -z "$pa" ]; then
+    _w_pct="$pb"; _w_reset="$rb"
+  elif [ -n "$pb" ]; then
+    # Rule 3 only applies when the tied resets_at names a real window (> 0); with no reset info
+    # on either side, the live payload always wins over the file.
+    if (( (ea && !eb) || (ea == eb && rb > ra) || (ea == eb && rb == ra && ra > 0 && ib > ia) )); then
+      _w_pct="$pb"; _w_reset="$rb"
+    fi
+  fi
+  # Winner already expired → the window rolled over; show a fresh (empty) window.
+  if [ -n "$_w_pct" ] && (( _w_reset > 0 && _w_reset <= now_ts )); then
+    _w_pct=0; _w_reset=0
+  fi
+}
+
+cached_5pct="" cached_5rst="" cached_7pct="" cached_7rst=""
+if [ -f "$rate_cache" ]; then
+  IFS=$'\037' read -r cached_5pct cached_5rst cached_7pct cached_7rst < "$rate_cache" 2>/dev/null
+fi
+payload_had_rate=""
+if [ -n "$five_hour_pct" ] || [ -n "$seven_day_pct" ]; then payload_had_rate=1; fi
+pick_window "$five_hour_pct" "$five_hour_reset" "$cached_5pct" "$cached_5rst"
+five_hour_pct="$_w_pct"; five_hour_reset="$_w_reset"
+pick_window "$seven_day_pct" "$seven_day_reset" "$cached_7pct" "$cached_7rst"
+seven_day_pct="$_w_pct"; seven_day_reset="$_w_reset"
+# Publish the merged snapshot only when this payload actually carried rate data — a data-less
+# tick (new session pre-first-response) must never rewrite the shared file it just read from.
+# Atomic mktemp+mv, same pattern as the git cache below.
+if [ -n "$payload_had_rate" ]; then
+  tmp_rate=$(mktemp "${rate_cache}.XXXXXX" 2>/dev/null)
+  if [ -n "$tmp_rate" ]; then
+    printf '%s\037%s\037%s\037%s' "$five_hour_pct" "$five_hour_reset" "$seven_day_pct" "$seven_day_reset" > "$tmp_rate" \
+      && mv "$tmp_rate" "$rate_cache"
+  fi
 fi
 
 # --- Git branch (cached for 5 seconds to avoid slow git calls) ---
@@ -242,6 +311,10 @@ fi
 # Context bar
 if [ -n "$ctx_pct" ]; then
   printf -v ctx_int "%.0f" "$ctx_pct" 2>/dev/null
+  # Same clamp as the rate windows: a full context can report a hair over 100 ("101%").
+  ctx_int=${ctx_int:-0}
+  (( ctx_int < 0 )) && ctx_int=0
+  (( ctx_int > 100 )) && ctx_int=100
   build_bar "$ctx_int"
   pct_color_val "$ctx_int"
   parts+=("${_pct_color}⛁ ${ctx_int}%${C_RESET} ${_bar_result}")

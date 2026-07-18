@@ -15,6 +15,8 @@ A compact, single-line statusline for [Claude Code](https://claude.com/claude-co
 - **Color-coded progress bars** — 10-cell braille blocks (`⣿⣀`) at 10% increments for context usage and both rate windows, with the percentage to the left: green under 50%, yellow 50–79%, red 80% and up. The gap-free fill mirrors Claude Code's own `/usage` bars.
 - **Both rate windows** — the 5-hour session window (`⏱`) and the 7-day weekly window (`⧖`) each get their own bar and reset time. Either window is rendered only when Claude Code sends it (they can be independently absent), so the weekly segment simply doesn't appear until there's data. Inspired by [claude-pace](https://github.com/Astro-Han/claude-pace).
 - **Absolute reset times** — each rate window shows *when* it resets, like the `/usage` view: `↻8:10pm` if it resets later today, `↻Jun 1` if it resets on another day. No pacing or projection math — just how much you've used and when it comes back.
+- **Rate limits synced across sessions** — Claude Code only refreshes `rate_limits` after an API call, so a fresh session (or a fresh login) shows nothing and an idle session keeps reporting a window that already reset. Every session publishes the freshest snapshot it has seen to a tiny shared file, and every render uses whichever snapshot is genuinely fresher — so a new session inherits the last-known usage and reset time immediately, and a stale session re-syncs the moment any other session gets fresh data. Once a window's `resets_at` passes, it rolls over to `0%` instead of freezing at its final stale value.
+- **Clamped percentages** — context and rate usage can come off the wire fractionally over 100 when fully spent (rendering as `101%`); everything is clamped to 0–100.
 - **Compact model name** — strips the `Claude ` prefix and collapses any `(1M context)` / `(200K context)` annotation to a bare size token, so `Claude Opus 4.7 (1M context)` shows as `Opus 4.7 1M` and `Claude Sonnet 4.6` as `Sonnet 4.6`.
 - **Single-pass jq extraction** — one `jq` invocation pulls all fields, avoiding the ~20-process fan-out of naive scripts.
 - **Cached git branch** — 5-second TTL so `git symbolic-ref` doesn't run on every statusline tick.
@@ -33,9 +35,9 @@ From left to right, each element is separated by a dim `·`:
 | **Lines changed** | `+35/-31` | green / red | Real `git diff` of the current branch/worktree against its fork point — every tracked line **added/removed since the branch diverged from the mainline**, counting committed, staged, and unstaged edits together. The fork point is the merge-base with the first of `main`, `master`, `origin/HEAD`, `origin/main`, or `origin/master` that shares history (so a feature branch shows all its work, and `main` itself shows just uncommitted changes). Untracked files are excluded, and the whole segment is hidden when the tree is clean. Computed inside the 5-second git cache, so no extra cost per tick. |
 | **Model** | `◆ Opus 4.7 1M` | yellow | `Claude ` prefix stripped; `(1M context)` / `(200K context)` collapsed to a bare size token. |
 | **Context usage** | `⛁ 23% ⣿⣿⣀⣀⣀⣀⣀⣀⣀⣀` | green / yellow / red | Percent of the context window consumed by the current conversation, with a 10-cell bar. Shows `⛁ --` before the first API response. |
-| **5-hour window** | `⏱ 74% ⣿⣿⣿⣿⣿⣿⣿⣀⣀⣀ ↻8:10pm` | green / yellow / red | Percent of the 5-hour rate limit used. Claude Pro/Max only. Shows `⏱ --` before the first API response. Appends the reset time when `resets_at` is present — see below. |
-| **7-day window** | `⧖ 36% ⣿⣿⣿⣿⣀⣀⣀⣀⣀⣀ ↻Jun 1` | green / yellow / red | Percent of the 7-day (weekly) rate limit used, read from `rate_limits.seven_day`. Same bar and reset time as the 5-hour window, distinguished by the `⧖` glyph. Silently skipped when the weekly window is absent from the payload. |
-| **Reset time** | `↻8:10pm` / `↻Jun 1` | grey | When the rate window resets, read from `resets_at`. Shows the clock time if it resets later today, otherwise the month + day. Hidden if the reset is in the past or further out than the window itself. |
+| **5-hour window** | `⏱ 74% ⣿⣿⣿⣿⣿⣿⣿⣀⣀⣀ ↻8:10pm` | green / yellow / red | Percent of the 5-hour rate limit used (clamped to 100). Claude Pro/Max only. Before the first API response it inherits the last-known snapshot from any other session; shows `⏱ --` only when no session has published one. Appends the reset time when `resets_at` is present — see below. |
+| **7-day window** | `⧖ 36% ⣿⣿⣿⣿⣀⣀⣀⣀⣀⣀ ↻Jun 1` | green / yellow / red | Percent of the 7-day (weekly) rate limit used, read from `rate_limits.seven_day` (clamped to 100). Same bar, reset time, and cross-session sync as the 5-hour window, distinguished by the `⧖` glyph. Silently skipped when the weekly window is absent from both the payload and the shared snapshot. |
+| **Reset time** | `↻8:10pm` / `↻Jun 1` | grey | When the rate window resets, read from `resets_at`. Shows the clock time if it resets later today, otherwise the month + day. Hidden if the reset is further out than the window itself. If the reset has already *passed*, the window rolled over — the segment shows `0%` with no `↻` (the new window's anchor is unknown until the next API response). |
 | **Output style** | `☰Explanatory` | magenta | Hidden when the style is `default`. Shows when you're in Learning, Explanatory, or a custom style. |
 | **Effort level** | `effort:high` | grey | Only when an effort level is set. |
 | **Vim mode** | `vim:NORMAL` | grey | Only when vim mode is active. |
@@ -82,13 +84,13 @@ Restart Claude Code (or open a new session) and the statusline should appear at 
 
 ### Testing
 
-A test suite covering 34 checks (full payloads, boundary values, missing fields, model-name shortening, braille bars, absolute reset times, the weekly window, worktree labelling, rapid redraws, performance) is included:
+A test suite covering 42 checks (full payloads, boundary values, missing fields, model-name shortening, braille bars, absolute reset times, percentage clamping, cross-session rate sync, the weekly window, worktree labelling, rapid redraws, performance) is included:
 
 ```sh
 bash ~/claude-statusline/test-statusline.sh
 ```
 
-Expected output ends with `All 36 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
+Expected output ends with `All 42 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
 
 ## Customization
 
@@ -99,6 +101,7 @@ All the meaningful knobs are in the top of `statusline-command.sh`:
 - **Bar glyphs** — filled/empty are `⣿` and `⣀` inside `build_bar`. Swap them for a different look (e.g. `█`/`░` for solid blocks, or `⡇`/`⡀` for a thinner braille line).
 - **Usage thresholds** — the 50% / 80% color break points live in `build_bar` and `pct_color_val`. Change them if you want different warning levels.
 - **Git cache TTL** — defaults to 5 seconds (search for `cache_age` / `-ge 5`). Raise it if your repo is huge and git calls are slow.
+- **Rate snapshot location** — the shared cross-session rate file lives at `$TMPDIR/claude-sl-rate`; set `CLAUDE_SL_CACHE_DIR` to move it (the test suite uses this for isolation). Delete the file to reset the sync state.
 - **Reset time format** — `build_rate_segment` formats the reset with `date` (`%l:%M%p` for today, `%b %e` otherwise). Adjust those format strings to taste (e.g. 24-hour clock).
 
 ## How the Update Indicator Works
@@ -120,7 +123,7 @@ Note that the symlink approach only works for Claude Code installed via the nati
 
 **Tests fail with multi-line output.** If the test suite reports `LINE COUNT: 2 lines (expected 1)`, something is emitting to stderr. Common cause: a jq type error on an unexpected field shape. Run the script manually with a sample payload and `2>&1 | cat -v` to see the error.
 
-**Progress bars show `⛁ --` and `⏱ --` instead of percentages.** This is normal before the first API response in a new session — the `context_window.used_percentage` and `rate_limits.five_hour.used_percentage` fields aren't populated yet. The bars will fill in after your first message.
+**Progress bars show `⛁ --` and `⏱ --` instead of percentages.** This is normal before the first API response in a brand-new session — the `context_window.used_percentage` and `rate_limits.five_hour.used_percentage` fields aren't populated yet. Context always waits for the first message (it's per-conversation), but the rate bars inherit the last-known snapshot from any other recent session, so `⏱ --` only appears when no session has published one (e.g. right after a reboot, since the snapshot lives in `$TMPDIR`).
 
 **Version doesn't show.** The `version` field in the JSON payload was added in a recent Claude Code release. Older versions don't send it, and the script silently skips the section.
 

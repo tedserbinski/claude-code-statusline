@@ -7,10 +7,18 @@ PASS=0
 FAIL=0
 TOTAL=0
 
+# Isolate the cross-session rate-limit snapshot from the developer's real one, and give each
+# scenario a clean slate — the sync tests below manage the file explicitly.
+CLAUDE_SL_CACHE_DIR=$(mktemp -d)
+export CLAUDE_SL_CACHE_DIR
+RATE_CACHE="$CLAUDE_SL_CACHE_DIR/claude-sl-rate"
+trap 'rm -rf "$CLAUDE_SL_CACHE_DIR"' EXIT
+
 run_test() {
   local name="$1" json="$2"
   TOTAL=$((TOTAL + 1))
   local errors=""
+  rm -f "$RATE_CACHE"
 
   # Capture stdout and stderr separately
   local stdout exit_code
@@ -207,6 +215,7 @@ run_test "Reset: 5h shows clock time" "{
   \"model\":{\"display_name\":\"Claude Opus 4.7\"},
   \"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":${RESET_SOON}}}
 }"
+rm -f "$RATE_CACHE"
 out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":${RESET_SOON}}}}" | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
 if echo "$out" | grep -qE '↻[0-9]{1,2}:[0-9]{2}(am|pm)' && ! echo "$out" | grep -qE '↻[A-Z][a-z][a-z] +[0-9]'; then
@@ -218,6 +227,7 @@ else
 fi
 
 # --- Scenario 17b: No pacing glyphs, even at high usage ---
+rm -f "$RATE_CACHE"
 out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":95,\"resets_at\":${RESET_SOON}}}}" | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
 if ! echo "$out" | grep -qE '⚠|⇡|⇣'; then
@@ -228,20 +238,24 @@ else
   printf "  \033[31m✗\033[0m Unexpected pacing glyph — output: %s\n" "$out"
 fi
 
-# --- Scenario 17d: Past reset is hidden (bar shown, no ↻) ---
+# --- Scenario 17d: Past reset = window rolled over → usage resets to 0%, no ↻ ---
+# Regression: a stale payload used to keep showing the old used% (e.g. a pegged 100%+) after the
+# window had already reset; it must render as a fresh window instead.
 RESET_PAST=$(($(date +%s) - 100))
-out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":${RESET_PAST}}}}" | bash "$SCRIPT" 2>/dev/null)
+rm -f "$RATE_CACHE"
+out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":101,\"resets_at\":${RESET_PAST}}}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 TOTAL=$((TOTAL + 1))
-if echo "$out" | grep -qF '40%' && ! echo "$out" | grep -qF '↻'; then
+if echo "$out" | grep -qF '⏱ 0%' && ! echo "$out" | grep -qF '↻' && ! echo "$out" | grep -qF '101'; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Past reset hidden (no ↻)\n"
+  printf "  \033[32m✓\033[0m Expired window rolls over to 0%% (no stale %%, no ↻)\n"
 else
   FAIL=$((FAIL + 1))
-  printf "  \033[31m✗\033[0m Past reset should hide ↻ — output: %s\n" "$out"
+  printf "  \033[31m✗\033[0m Expired window should show 0%% with no ↻ — output: %s\n" "$out"
 fi
 
 # --- Scenario 17e: Far-future reset (beyond the window) is hidden ---
 RESET_FAR=$(($(date +%s) + 100000))   # ~27h, well beyond the 5h window
+rm -f "$RATE_CACHE"
 out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":${RESET_FAR}}}}" | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
 if ! echo "$out" | grep -qF '↻'; then
@@ -250,6 +264,64 @@ if ! echo "$out" | grep -qF '↻'; then
 else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Far-future reset should hide ↻ — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e2: Percentages clamp at 100 (context and rate windows) ---
+# The payload can report fractionally over 100 when everything is spent; "101%"/"105%" must
+# never render.
+rm -f "$RATE_CACHE"
+RESET_LIVE=$(($(date +%s) + 7200))
+out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"context_window\":{\"used_percentage\":100.6},\"rate_limits\":{\"five_hour\":{\"used_percentage\":105,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⛁ 100%' && echo "$out" | grep -qF '⏱ 100%' && ! echo "$out" | grep -qE '10[15]%'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Over-100 payload clamps to 100%% (no 101%%)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Percentages should clamp at 100 — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e3: New session inherits the shared rate snapshot ---
+# A fresh session (or fresh login) has no rate_limits until its first API response; it must show
+# the last-known live window from the shared snapshot instead of "⏱ --".
+rm -f "$RATE_CACHE"
+echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":63,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" >/dev/null 2>&1   # session A publishes
+out=$(echo '{"model":{"display_name":"x"}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')  # session B, no rate data yet
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ 63%' && ! echo "$out" | grep -qF '⏱ --'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m New session inherits shared rate snapshot (63%%, not --)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m New session should inherit cached 63%% — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e4: Stale session defers to a fresher shared snapshot ---
+# An idle session still reporting an expired window (pegged over 100%) must pick up the live
+# window another session published — usage AND reset time re-sync.
+rm -f "$RATE_CACHE"
+echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":55,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" >/dev/null 2>&1   # fresh session publishes
+out=$(echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":101,\"resets_at\":${RESET_PAST}}}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ 55%' && echo "$out" | grep -qF '↻' && ! echo "$out" | grep -qF '101'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Stale session re-syncs to fresher snapshot (55%% + ↻)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Stale session should show fresher 55%% with ↻ — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e5: Same window — higher used%% wins regardless of write order ---
+rm -f "$RATE_CACHE"
+echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":70,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" >/dev/null 2>&1
+out=$(echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":30,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ 70%'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Same window: higher used%% (70%%) beats a lagging 30%%\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Same-window merge should keep 70%% — output: %s\n" "$out"
 fi
 
 # --- Scenario 17f: Git cache isolation between repos ---
@@ -432,6 +504,7 @@ run_test "Weekly window renders (⧖ + dated reset)" "{
   \"model\":{\"display_name\":\"Claude Opus 4.7\"},
   \"rate_limits\":{\"five_hour\":{\"used_percentage\":40},\"seven_day\":{\"used_percentage\":38,\"resets_at\":${RESET_7D}}}
 }"
+rm -f "$RATE_CACHE"
 out=$(echo "{\"model\":{\"display_name\":\"Claude Opus 4.7\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":40},\"seven_day\":{\"used_percentage\":38,\"resets_at\":${RESET_7D}}}}" | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
 if echo "$out" | grep -qF '⧖' && echo "$out" | grep -qE '↻[A-Z][a-z][a-z] +[0-9]'; then
@@ -447,6 +520,7 @@ run_test "Weekly absent (⧖ skipped)" '{
   "model":{"display_name":"Claude Opus 4.7"},
   "rate_limits":{"five_hour":{"used_percentage":40}}
 }'
+rm -f "$RATE_CACHE"
 out=$(echo '{"model":{"display_name":"Claude Opus 4.7"},"rate_limits":{"five_hour":{"used_percentage":40}}}' | bash "$SCRIPT" 2>/dev/null)
 TOTAL=$((TOTAL + 1))
 if ! echo "$out" | grep -qF '⧖'; then
