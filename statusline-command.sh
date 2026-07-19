@@ -8,6 +8,10 @@
 
 input=$(cat)
 
+# One timestamp per render — every freshness/expiry check below compares against this instead
+# of spawning its own `date` subprocess.
+now_ts=$(date +%s)
+
 # --- ANSI colors ---
 C_GREEN="\033[32m"
 C_YELLOW="\033[33m"
@@ -20,6 +24,7 @@ C_DIM_WHITE="\033[38;5;250m"
 C_RESET="\033[0m"
 
 # --- Progress bar helpers (set variables, no subshells) ---
+# Sets _bar_result (colored bar) and _pct_color (the same threshold color, for the % text).
 build_bar() {
   local pct=${1:-0} total=${2:-10}
   local filled=$(( (pct * total + 50) / 100 ))
@@ -28,16 +33,20 @@ build_bar() {
   # dots) for the empty track. Swap these two glyphs to restyle (e.g. █/░ solid, ⡇/⡀ thin).
   for ((i=0; i<filled; i++));     do bar="${bar}⣿"; done
   for ((i=filled; i<total; i++)); do bar="${bar}⣀"; done
-  local color="$C_GREEN"
-  (( pct >= 50 )) && color="$C_YELLOW"
-  (( pct >= 80 )) && color="$C_RED"
-  _bar_result="${color}${bar}${C_RESET}"
+  _pct_color="$C_GREEN"
+  (( pct >= 50 )) && _pct_color="$C_YELLOW"
+  (( pct >= 80 )) && _pct_color="$C_RED"
+  _bar_result="${_pct_color}${bar}${C_RESET}"
 }
 
-pct_color_val() {
-  _pct_color="$C_GREEN"
-  (( ${1:-0} >= 50 )) && _pct_color="$C_YELLOW"
-  (( ${1:-0} >= 80 )) && _pct_color="$C_RED"
+# Round a possibly-fractional percentage to an int in _pct_int, clamped to 0–100: the API can
+# report fractionally over 100 when a window is fully spent (e.g. 100.6 → "101%"), and a
+# bar/percentage past 100 reads as a bug, not a state. Garbage input clamps to 0.
+clamp_pct() {
+  printf -v _pct_int "%.0f" "${1:-0}" 2>/dev/null
+  _pct_int=${_pct_int:-0}
+  (( _pct_int < 0 )) && _pct_int=0
+  (( _pct_int > 100 )) && _pct_int=100
 }
 
 # --- Rate-limit segment builder ---
@@ -47,26 +56,20 @@ pct_color_val() {
 #   ↻Jun 1  = resets further out — shown as month/day (the weekly window). Result in _rate_segment.
 build_rate_segment() {
   local used_raw="$1" reset_ts="$2" window="$3" glyph="$4"
-  local u_int; printf -v u_int "%.0f" "$used_raw" 2>/dev/null
-  # Clamp to 0–100: the API can report fractionally over 100 when a window is fully spent
-  # (e.g. 100.6 → "101%"), and a bar/percentage past 100 reads as a bug, not a state.
-  u_int=${u_int:-0}
-  (( u_int < 0 )) && u_int=0
-  (( u_int > 100 )) && u_int=100
+  clamp_pct "$used_raw"
+  local u_int="$_pct_int"
   build_bar "$u_int"
-  pct_color_val "$u_int"
   local reset=""
   if [[ "$reset_ts" =~ ^[0-9]+$ ]] && (( reset_ts > 0 )); then
     # Trust the reset only when it's in the future and no further out than the window itself
     # (guards stale/garbage timestamps).
-    local now; now=$(date +%s)
-    if (( reset_ts > now && reset_ts - now <= window )); then
+    if (( reset_ts > now_ts && reset_ts - now_ts <= window )); then
       # Within 24h → clock time (%l:%M%p), even across midnight; further out → month/day (%b %e).
       # The choice is by time-to-reset, NOT calendar date — a 5h window resetting at 1am tomorrow
       # should read "1:10am", not "May 27". Both formats produced in one `date` call.
       local fmt; fmt=$(date -r "$reset_ts" '+%l:%M%p|%b %e')
       local r
-      if (( reset_ts - now <= 86400 )); then r="${fmt%%|*}"; else r="${fmt#*|}"; fi
+      if (( reset_ts - now_ts <= 86400 )); then r="${fmt%%|*}"; else r="${fmt#*|}"; fi
       r="${r//  / }"; r="${r# }"; r="${r//AM/am}"; r="${r//PM/pm}"   # "  8:10PM" → "8:10pm"
       reset=" ${C_GREY}↻${r}${C_RESET}"
     fi
@@ -115,7 +118,6 @@ fi
 # because the next window's anchor is unknown until the next API response.
 # CLAUDE_SL_CACHE_DIR overrides the location (used by the test suite for isolation).
 rate_cache="${CLAUDE_SL_CACHE_DIR:-${TMPDIR:-/tmp}}/claude-sl-rate"
-now_ts=$(date +%s)
 
 # args: pct_a reset_a pct_b reset_b — leaves the fresher snapshot in _w_pct/_w_reset
 pick_window() {
@@ -177,7 +179,7 @@ if [ -n "$cwd" ]; then
   cache_file="${TMPDIR:-/tmp}/claude-sl-git${cwd//\//_}"
   cache_age=999999999
   if [ -f "$cache_file" ]; then
-    cache_age=$(( $(date +%s) - $(stat -f%m "$cache_file" 2>/dev/null || echo 0) ))
+    cache_age=$(( now_ts - $(stat -f%m "$cache_file" 2>/dev/null || echo 0) ))
   fi
   if [ "$cache_age" -ge 5 ]; then
     if git -C "$cwd" rev-parse --git-dir > /dev/null 2>&1; then
@@ -314,14 +316,10 @@ fi
 
 # Context bar
 if [ -n "$ctx_pct" ]; then
-  printf -v ctx_int "%.0f" "$ctx_pct" 2>/dev/null
   # Same clamp as the rate windows: a full context can report a hair over 100 ("101%").
-  ctx_int=${ctx_int:-0}
-  (( ctx_int < 0 )) && ctx_int=0
-  (( ctx_int > 100 )) && ctx_int=100
-  build_bar "$ctx_int"
-  pct_color_val "$ctx_int"
-  parts+=("${_pct_color}⛁ ${ctx_int}%${C_RESET} ${_bar_result}")
+  clamp_pct "$ctx_pct"
+  build_bar "$_pct_int"
+  parts+=("${_pct_color}⛁ ${_pct_int}%${C_RESET} ${_bar_result}")
 else
   parts+=("${C_GREY}⛁ --${C_RESET}")
 fi
