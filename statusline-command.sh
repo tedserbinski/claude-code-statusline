@@ -105,8 +105,12 @@ fi
 # session publishes the freshest rate data it has seen, and every render uses whichever snapshot
 # (this payload vs the shared file) is genuinely fresher. Freshness rules, per window:
 #   1. an unexpired snapshot beats an expired one (expired = resets_at in the past)
-#   2. a later resets_at beats an earlier one (it's a newer window)
-#   3. same real window (equal resets_at) → the higher used% is newer (usage only grows)
+#   2. same real window (equal resets_at) → the higher used% is newer (usage only grows)
+#   3. otherwise the live payload wins. In particular, two UNEXPIRED snapshots with different
+#      resets_at can't both describe the current window (a new window only starts after the old
+#      one expires, which rule 1 already handles) — the cached anchor is from another account,
+#      plan, or a shifted reset schedule, so the payload straight from the API is the truth.
+#      Preferring the later anchor here would let one bad snapshot pin the file until it expires.
 # If the winner is itself expired, the window has rolled over: usage renders as 0% with no ↻,
 # because the next window's anchor is unknown until the next API response.
 # CLAUDE_SL_CACHE_DIR overrides the location (used by the test suite for isolation).
@@ -128,9 +132,9 @@ pick_window() {
   if [ -z "$pa" ]; then
     _w_pct="$pb"; _w_reset="$rb"
   elif [ -n "$pb" ]; then
-    # Rule 3 only applies when the tied resets_at names a real window (> 0); with no reset info
+    # Rule 2 only applies when the tied resets_at names a real window (> 0); with no reset info
     # on either side, the live payload always wins over the file.
-    if (( (ea && !eb) || (ea == eb && rb > ra) || (ea == eb && rb == ra && ra > 0 && ib > ia) )); then
+    if (( (ea && !eb) || (rb == ra && ra > 0 && ib > ia) )); then
       _w_pct="$pb"; _w_reset="$rb"
     fi
   fi

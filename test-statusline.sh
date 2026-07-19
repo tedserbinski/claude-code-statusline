@@ -324,6 +324,24 @@ else
   printf "  \033[31m✗\033[0m Same-window merge should keep 70%% — output: %s\n" "$out"
 fi
 
+# --- Scenario 17e6: Live payload beats a cached snapshot with a mismatched (later) anchor ---
+# Two unexpired snapshots with different resets_at can't be the same window; the cached one is
+# from another account/plan or a shifted reset schedule. The live API data must win — under the
+# old "later resets_at wins" rule, the bad cache entry pinned the display until it expired.
+rm -f "$RATE_CACHE"
+RESET_WK_LIVE=$(($(date +%s) + 1 * 86400))
+RESET_WK_STALE=$(($(date +%s) + 4 * 86400))
+printf '34\037%s\03753\037%s' "$RESET_LIVE" "$RESET_WK_STALE" > "$RATE_CACHE"   # poisoned weekly snapshot
+out=$(echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":36,\"resets_at\":${RESET_LIVE}},\"seven_day\":{\"used_percentage\":94,\"resets_at\":${RESET_WK_LIVE}}}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⧖ 94%' && ! echo "$out" | grep -qF '53'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Live 94%% beats cached 53%% with mismatched later anchor\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Live 94%% should beat mismatched cache — output: %s\n" "$out"
+fi
+
 # --- Scenario 17f: Git cache isolation between repos ---
 # Verify that two concurrent sessions in different repos don't share branch cache.
 REPO_A=$(mktemp -d)
