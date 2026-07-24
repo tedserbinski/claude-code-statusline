@@ -9,16 +9,21 @@ TOTAL=0
 
 # Isolate the cross-session rate-limit snapshot from the developer's real one, and give each
 # scenario a clean slate — the sync tests below manage the file explicitly.
+# The snapshot is keyed by logged-in account; CLAUDE_SL_ACCOUNT pins it so the suite never reads
+# the developer's ~/.claude.json (and the account-switch tests can move between accounts at will).
 CLAUDE_SL_CACHE_DIR=$(mktemp -d)
 export CLAUDE_SL_CACHE_DIR
-RATE_CACHE="$CLAUDE_SL_CACHE_DIR/claude-sl-rate"
+CLAUDE_SL_ACCOUNT="acct-a"
+export CLAUDE_SL_ACCOUNT
+RATE_CACHE="$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-a"
+RATE_CACHE_B="$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-b"
 trap 'rm -rf "$CLAUDE_SL_CACHE_DIR"' EXIT
 
 run_test() {
   local name="$1" json="$2"
   TOTAL=$((TOTAL + 1))
   local errors=""
-  rm -f "$RATE_CACHE"
+  rm -f "$RATE_CACHE" "$RATE_CACHE_B"
 
   # Capture stdout and stderr separately
   local stdout exit_code
@@ -340,6 +345,62 @@ if echo "$out" | grep -qF '⧖ 94%' && ! echo "$out" | grep -qF '53'; then
 else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Live 94%% should beat mismatched cache — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e7: A different account does NOT inherit the previous account's snapshot ---
+# Rate limits are per account. After /login to another account, its first (data-less) ticks must
+# show "⏱ --", not the account you just left.
+rm -f "$RATE_CACHE" "$RATE_CACHE_B"
+echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":63,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" >/dev/null 2>&1   # account A publishes
+out=$(echo '{"model":{"display_name":"x"}}' | CLAUDE_SL_ACCOUNT=acct-b bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ --' && ! echo "$out" | grep -qF '63'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Switched account shows -- instead of the previous account's 63%%\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Switched account leaked previous usage — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e8: Switching back restores that account's own last-known window ---
+# The whole point of keying by account: account A's snapshot survived the trip through B.
+out=$(echo '{"model":{"display_name":"x"}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ 63%'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Switching back restores account A's own 63%% immediately\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Switching back should restore 63%% — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e9: Carried-over rate data from the previous account is ignored ---
+# Claude Code keeps rate limits in memory per process, so a session that was already running when
+# you switched accounts keeps reporting the OLD account's numbers — same used%, same resets_at —
+# until its next API call. That payload must neither render nor be published as the new account's.
+rm -f "$RATE_CACHE_B"
+out=$(echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":63,\"resets_at\":${RESET_LIVE}}}}" | CLAUDE_SL_ACCOUNT=acct-b bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ --' && [ ! -f "$RATE_CACHE_B" ]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Carried-over payload from previous account ignored (and not published)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Carried-over payload should be ignored — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e10: Same used%% on a DIFFERENT anchor is real data, not carry-over ---
+# The carry-over guard keys on the exact reset second; an equal percentage alone must not suppress
+# the new account's genuinely fresh window.
+rm -f "$RATE_CACHE_B"
+out=$(echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":63,\"resets_at\":$((RESET_LIVE + 37))}}}" | CLAUDE_SL_ACCOUNT=acct-b bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ 63%' && echo "$out" | grep -qF '↻' && [ -f "$RATE_CACHE_B" ]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Same %% on a different anchor is trusted as the new account's data\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Fresh data for the new account was wrongly suppressed — output: %s\n" "$out"
 fi
 
 # --- Scenario 17f: Git cache isolation between repos ---

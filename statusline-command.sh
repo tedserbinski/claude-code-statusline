@@ -100,6 +100,43 @@ if [[ "$model" =~ ^(.+)\ \(([0-9]+[KMkm])\ context\)$ ]]; then
   model="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
 fi
 
+# --- Which Claude account is logged in? ---
+# Rate limits belong to an account, and Claude Code's login is global — /login switches every
+# running session at once — so the shared snapshot below is keyed by account. Switching away and
+# back then restores that account's own last-known usage instead of showing the other account's.
+# The id comes from oauthAccount in ~/.claude.json (CLAUDE_CONFIG_DIR relocates the dir), which is
+# rewritten the moment a login completes. That file can grow large on long-lived installs, so the
+# lookup is cached for 5s — the same TTL as the git cache, and far shorter than a login flow takes,
+# so a switch is still picked up effectively immediately.
+# CLAUDE_SL_ACCOUNT pins the id explicitly (used by the test suite). An unknown account — logged
+# out, or API-key auth, which has no subscription rate limits at all — falls back to the
+# unsuffixed snapshot, which is also what installs that predate this keying already use.
+cache_dir="${CLAUDE_SL_CACHE_DIR:-${TMPDIR:-/tmp}}"
+account="${CLAUDE_SL_ACCOUNT-}"
+if [ -z "${CLAUDE_SL_ACCOUNT+set}" ]; then
+  acct_cache="${cache_dir}/claude-sl-account"
+  acct_age=999999999
+  if [ -f "$acct_cache" ]; then
+    acct_age=$(( now_ts - $(stat -f%m "$acct_cache" 2>/dev/null || echo 0) ))
+  fi
+  if [ "$acct_age" -ge 5 ]; then
+    cc_config="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+    if [ -r "$cc_config" ]; then
+      # Indexing a missing/null .oauthAccount yields null in jq, so this stays quiet when logged out.
+      account=$(jq -r '.oauthAccount.accountUuid // .oauthAccount.emailAddress // ""' "$cc_config" 2>/dev/null)
+    fi
+    # Reduce to a safe filename component — the uuid already is one, an email address isn't.
+    account="${account//[^A-Za-z0-9._-]/_}"
+    # Temp files are dot-prefixed so they can never be globbed as an account snapshot below.
+    tmp_acct=$(mktemp "${cache_dir}/.claude-sl-account.XXXXXX" 2>/dev/null)
+    if [ -n "$tmp_acct" ]; then
+      printf '%s' "$account" > "$tmp_acct" && mv "$tmp_acct" "$acct_cache"
+    fi
+  else
+    IFS= read -r account < "$acct_cache" 2>/dev/null
+  fi
+fi
+
 # --- Rate-limit sync across sessions (login/logout, concurrent sessions) ---
 # Claude Code only refreshes rate_limits after an API call, so any one session's payload can be
 # stale in two ways: a brand-new session (or fresh login) has no rate_limits at all until its first
@@ -117,7 +154,8 @@ fi
 # If the winner is itself expired, the window has rolled over: usage renders as 0% with no ↻,
 # because the next window's anchor is unknown until the next API response.
 # CLAUDE_SL_CACHE_DIR overrides the location (used by the test suite for isolation).
-rate_cache="${CLAUDE_SL_CACHE_DIR:-${TMPDIR:-/tmp}}/claude-sl-rate"
+rate_cache="${cache_dir}/claude-sl-rate"
+[ -n "$account" ] && rate_cache="${rate_cache}-${account}"
 
 # args: pct_a reset_a pct_b reset_b — leaves the fresher snapshot in _w_pct/_w_reset
 pick_window() {
@@ -146,6 +184,33 @@ pick_window() {
   fi
 }
 
+# Drop rate data that provably belongs to the account you just switched away from. Claude Code
+# holds rate limits in memory per process and only refreshes them when an API response comes back,
+# so after /login every already-running session keeps reporting the PREVIOUS account's numbers —
+# for as long as it sits idle. Such a payload is identical, to the second, to what that account
+# last published: same used% AND the same resets_at anchor. Windows are anchored per account at
+# first use, so two accounts genuinely sharing a reset second doesn't happen — the exact-anchor
+# match is what makes this safe to act on. Matching windows are dropped rather than believed, which
+# also keeps them from poisoning this account's snapshot; the moment a real response for the new
+# account arrives the values differ and the payload is trusted again. Each window is judged on its
+# own, so a stale weekly window can't suppress a freshly-updated session window.
+for other in "${cache_dir}"/claude-sl-rate "${cache_dir}"/claude-sl-rate-*; do
+  # Nothing left to vet once both windows have been dropped (or never arrived).
+  [ -n "$five_hour_pct" ] || [ -n "$seven_day_pct" ] || break
+  # Skip this account's own snapshot, and the unexpanded glob when no other account has one.
+  [ -f "$other" ] && [ "$other" != "$rate_cache" ] || continue
+  other_5pct="" other_5rst="" other_7pct="" other_7rst=""
+  IFS=$'\037' read -r other_5pct other_5rst other_7pct other_7rst < "$other" 2>/dev/null
+  if [ -n "$five_hour_pct" ] && [ "$five_hour_pct" = "$other_5pct" ] \
+     && [ "$five_hour_reset" = "$other_5rst" ] && [[ "$five_hour_reset" =~ ^[1-9][0-9]*$ ]]; then
+    five_hour_pct=""; five_hour_reset=0
+  fi
+  if [ -n "$seven_day_pct" ] && [ "$seven_day_pct" = "$other_7pct" ] \
+     && [ "$seven_day_reset" = "$other_7rst" ] && [[ "$seven_day_reset" =~ ^[1-9][0-9]*$ ]]; then
+    seven_day_pct=""; seven_day_reset=0
+  fi
+done
+
 cached_5pct="" cached_5rst="" cached_7pct="" cached_7rst=""
 if [ -f "$rate_cache" ]; then
   IFS=$'\037' read -r cached_5pct cached_5rst cached_7pct cached_7rst < "$rate_cache" 2>/dev/null
@@ -160,7 +225,7 @@ seven_day_pct="$_w_pct"; seven_day_reset="$_w_reset"
 # tick (new session pre-first-response) must never rewrite the shared file it just read from.
 # Atomic mktemp+mv, same pattern as the git cache below.
 if [ -n "$payload_had_rate" ]; then
-  tmp_rate=$(mktemp "${rate_cache}.XXXXXX" 2>/dev/null)
+  tmp_rate=$(mktemp "${cache_dir}/.claude-sl-rate.XXXXXX" 2>/dev/null)
   if [ -n "$tmp_rate" ]; then
     printf '%s\037%s\037%s\037%s' "$five_hour_pct" "$five_hour_reset" "$seven_day_pct" "$seven_day_reset" > "$tmp_rate" \
       && mv "$tmp_rate" "$rate_cache"
