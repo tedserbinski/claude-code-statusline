@@ -11,7 +11,7 @@ A compact, single-line statusline for [Claude Code](https://claude.com/claude-co
 - **Session ID auto-hide** — when a session is named (via `/rename`), the lavender `[id]` block is hidden since Claude Code already shows the name in its header. Only unnamed sessions show a truncated `[abc12345]` block as a reminder to name the session.
 - **Update-ready indicator** — a green refresh arrow (`↻`) appears next to the version number when a newer Claude Code is installed than the one currently running. Detected by reading the versioned symlink target, no subprocess spawn.
 - **Graceful degradation** — every element is conditional. If a field is missing from the input JSON (older Claude Code versions, pending data before the first API response, etc.), the section is silently skipped rather than showing `null` or `0`.
-- **Worktree-aware branch** — inside a linked git worktree, the branch element appends the worktree name with an `↳` marker (`⎇ feat ↳ wt-name`); the main checkout shows just `⎇ branch`. Detected from the worktree's git-dir, so it works however the worktree was created.
+- **Worktree-aware location** — inside a linked git worktree, an `↳ wt-name` label sits between the directory and the branch (`~/repo ↳ wt-name ⎇ feat`); the main checkout shows just the directory and branch. Detection is from the worktree's git-dir, so it works however the worktree was created, but the label is the checkout directory's own name — git's internal worktree id is a sanitized, de-duplicated basename that can degrade to `0` or `-`.
 - **Color-coded progress bars** — 10-cell braille blocks (`⣿⣀`) at 10% increments for context usage and both rate windows, with the percentage to the left: green under 50%, yellow 50–79%, red 80% and up. The gap-free fill mirrors Claude Code's own `/usage` bars.
 - **Both rate windows** — the 5-hour session window (`⏱`) and the 7-day weekly window (`⧖`) each get their own bar and reset time. Either window is rendered only when Claude Code sends it (they can be independently absent), so the weekly segment simply doesn't appear until there's data. Inspired by [claude-pace](https://github.com/Astro-Han/claude-pace).
 - **Absolute reset times** — each rate window shows *when* it resets, like the `/usage` view: `↻8:10pm` if it resets later today, `↻Jun 1` if it resets on another day. No pacing or projection math — just how much you've used and when it comes back.
@@ -19,8 +19,8 @@ A compact, single-line statusline for [Claude Code](https://claude.com/claude-co
 - **Per-account rate limits** — rate limits belong to a Claude account, and `/login` switches every running session at once, so the shared snapshot is keyed by the account in `~/.claude.json`. Log into another account and the bars start clean (`⏱ --`) instead of showing the account you just left; log back in and that account's own last-known usage is restored immediately rather than waiting for the next API response. Claude Code keeps rate limits in memory per process, so sessions that were already running keep reporting the previous account's numbers until their next API call — a payload that matches another account's last snapshot exactly (same used% *and* the same reset second) is treated as that carry-over and ignored, so it never renders and never poisons the new account's snapshot.
 - **Clamped percentages** — context and rate usage can come off the wire fractionally over 100 when fully spent (rendering as `101%`); everything is clamped to 0–100.
 - **Compact model name** — strips the `Claude ` prefix and collapses any `(1M context)` / `(200K context)` annotation to a bare size token, so `Claude Opus 4.7 (1M context)` shows as `Opus 4.7 1M` and `Claude Sonnet 4.6` as `Sonnet 4.6`.
-- **Single-pass jq extraction** — one `jq` invocation pulls all fields, avoiding the ~20-process fan-out of naive scripts.
-- **Cached git branch** — 5-second TTL so `git symbolic-ref` doesn't run on every statusline tick.
+- **Single-pass jq extraction** — one `jq` invocation pulls every field out of the payload, avoiding the ~20-process fan-out of naive scripts. (A second, much smaller `jq` reads the logged-in account from `~/.claude.json`, at most once every 5 seconds.)
+- **Cached git work** — a single 5-second TTL covers the branch, the worktree label, and the lines-changed diff, so `git` doesn't run on every statusline tick.
 - **Terminal-safe output** — leading and trailing ANSI resets prevent color bleed into surrounding content, no trailing newline (Claude Code counts newlines to determine row count).
 
 ## Statusline Elements
@@ -30,9 +30,9 @@ From left to right, each element is separated by a dim `·`:
 | Element | Example | Color | Notes |
 | --- | --- | --- | --- |
 | **Session ID** | `[abc12345]` | lavender | Only when session is unnamed. First 8 chars of the session UUID. |
-| **Directory** | `~/Documents/projects` | cyan | Home directory is abbreviated to `~`. |
-| **Git branch** | `⎇ main` | green | Only when inside a git repo. Falls back to short commit SHA if HEAD is detached. |
-| **Worktree** | `↳ wt-name` | lavender | Appended to the branch (`⎇ feat ↳ wt-name`) only when inside a *linked* git worktree. The name is the worktree's git-dir basename. |
+| **Directory** | `~/Documents/projects` | yellow | Home directory is abbreviated to `~`. A `<repo>/.claude/worktrees/<name>` tail collapses back to the repo root, so a worktree shows its repo path plus the `↳` label rather than a long nested path. |
+| **Worktree** | `↳ wt-name` | sea green | Shown between the directory and the branch (`~/repo ↳ wt-name ⎇ feat`) only when inside a *linked* git worktree. The name is the worktree's **checkout directory** name, not git's internal worktree id — that id is a sanitized, de-duplicated basename that can degrade to `0` or `-` on collision. |
+| **Git branch** | `⎇ main` | blue | Only when inside a git repo. Falls back to short commit SHA if HEAD is detached. |
 | **Lines changed** | `+35/-31` | green / red | Real `git diff` of the current branch/worktree against its fork point — every tracked line **added/removed since the branch diverged from the mainline**, counting committed, staged, and unstaged edits together. The fork point is the merge-base with the first of `main`, `master`, `origin/HEAD`, `origin/main`, or `origin/master` that shares history (so a feature branch shows all its work, and `main` itself shows just uncommitted changes). Untracked files are excluded, and the whole segment is hidden when the tree is clean. Computed inside the 5-second git cache, so no extra cost per tick. |
 | **Model** | `◆ Opus 4.7 1M` | yellow | `Claude ` prefix stripped; `(1M context)` / `(200K context)` collapsed to a bare size token. |
 | **Context usage** | `⛁ 23% ⣿⣿⣀⣀⣀⣀⣀⣀⣀⣀` | green / yellow / red | Percent of the context window consumed by the current conversation, with a 10-cell bar. Shows `⛁ --` before the first API response. |
@@ -97,10 +97,10 @@ Expected output ends with `All 47 tests passed ✓`. If any test fails, the outp
 
 All the meaningful knobs are in the top of `statusline-command.sh`:
 
-- **Colors** — the `C_CYAN`, `C_GREEN`, etc. variables near the top (lines 12–19) use standard ANSI 16-color codes and 256-color escapes. Swap in your own palette.
+- **Colors** — the `C_GREEN`, `C_YELLOW`, `C_LAVENDER`, etc. variables near the top of the script use standard ANSI 16-color codes and 256-color escapes. Swap in your own palette.
 - **Bar width** — `build_bar`'s default total is 10 cells, one per 10% (search for `total=`). Lower it for more compact bars, raise it for finer granularity.
 - **Bar glyphs** — filled/empty are `⣿` and `⣀` inside `build_bar`. Swap them for a different look (e.g. `█`/`░` for solid blocks, or `⡇`/`⡀` for a thinner braille line).
-- **Usage thresholds** — the 50% / 80% color break points live in `build_bar` and `pct_color_val`. Change them if you want different warning levels.
+- **Usage thresholds** — the 50% / 80% color break points live in `build_bar`, which sets the bar color and the matching percentage color together. Change them if you want different warning levels.
 - **Git cache TTL** — defaults to 5 seconds (search for `cache_age` / `-ge 5`). Raise it if your repo is huge and git calls are slow.
 - **Rate snapshot location** — the shared cross-session rate file lives at `$TMPDIR/claude-sl-rate-<account-uuid>`, next to a `claude-sl-account` file caching which account is logged in (5-second TTL, so a `/login` is picked up almost immediately). Set `CLAUDE_SL_CACHE_DIR` to move both (the test suite uses this for isolation). Delete a snapshot to reset the sync state for that account. Logged out — or authenticating with an API key, which has no subscription rate limits — falls back to the unsuffixed `claude-sl-rate`.
 - **Account identity** — read from `oauthAccount` in `$CLAUDE_CONFIG_DIR/.claude.json` (defaults to `~/.claude.json`). Set `CLAUDE_SL_ACCOUNT` to pin it yourself and skip that lookup entirely.
@@ -133,7 +133,7 @@ Note that the symlink approach only works for Claude Code installed via the nati
 
 ## Design Notes
 
-- **Single jq call** — extracting 11 fields in one `jq -r '@sh ...'` call and using `eval` to assign them is roughly 10x faster than the naive `var=$(echo "$input" | jq -r '.foo')` pattern repeated per field.
+- **Single jq call** — extracting all 13 payload fields in one `jq -r '@sh ...'` call and using `eval` to assign them is roughly 10x faster than the naive `var=$(echo "$input" | jq -r '.foo')` pattern repeated per field.
 - **Variable-based helpers instead of subshell capture** — `build_bar` writes to a global `_bar_result` variable instead of echoing, so callers don't incur a subshell per call. This matters because subshell stdout capture can interleave ANSI escape sequences across buffer boundaries in rare cases.
 - **Leading ANSI reset** — every output line starts with `\033[0m` to override Claude Code's ambient dim styling. Pattern borrowed from [ccstatusline](https://github.com/sirmalloc/ccstatusline).
 - **No trailing newline** — Claude Code counts `\n` characters to determine how many rows the statusline occupies. An extra newline at the end is counted as a second row, which breaks layout math on some versions.
