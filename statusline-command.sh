@@ -136,71 +136,77 @@ if [ -z "${CLAUDE_SL_ACCOUNT+set}" ]; then
     IFS= read -r account < "$acct_cache" 2>/dev/null
   fi
 fi
-
-# --- Rate-limit sync across sessions (login/logout, concurrent sessions) ---
-# Claude Code only refreshes rate_limits after an API call, so any one session's payload can be
-# stale in two ways: a brand-new session (or fresh login) has no rate_limits at all until its first
-# response, and an idle session keeps reporting a window that already reset — including a pegged
-# "100% used" long after the limit came back. Fix both with a tiny shared snapshot file: every
-# session publishes the freshest rate data it has seen, and every render uses whichever snapshot
-# (this payload vs the shared file) is genuinely fresher. Freshness rules, per window:
-#   1. an unexpired snapshot beats an expired one (expired = resets_at in the past)
-#   2. same real window (equal resets_at) → the higher used% is newer (usage only grows)
-#   3. otherwise the live payload wins. In particular, two UNEXPIRED snapshots with different
-#      resets_at can't both describe the current window (a new window only starts after the old
-#      one expires, which rule 1 already handles) — the cached anchor is from another account,
-#      plan, or a shifted reset schedule, so the payload straight from the API is the truth.
-#      Preferring the later anchor here would let one bad snapshot pin the file until it expires.
+# --- Rate-limit sync across sessions (login/logout, concurrent sessions, limit changes) ---
+# Claude Code holds rate limits in memory per process, filled in only from API response headers,
+# so any one session's payload can be stale: a brand-new session has no rate_limits until its
+# first response, and an idle session replays the same numbers — a pegged 100%, the window as it
+# stood before a limit boost, the account you switched away from — until its next API call.
+# Nothing in the payload says WHEN those numbers were fetched, so this script measures it: a
+# process only changes its rate limits when a new response arrives, so a value that differs from
+# what this session reported on its previous tick was fetched now, and an unchanged value is a
+# replay that keeps its original fetch time. Every session records what it last reported (keyed by
+# session id) and publishes its observation to a per-account shared snapshot; every render shows
+# whichever observation — this payload's or the shared file's — is newer. Freshness is never
+# inferred from the numbers themselves: "usage only grows within a window" is false the moment a
+# limit is boosted or reset, and that inference once pinned a spent window at 100% until it expired.
+# Per window:
+#   1. an unexpired observation beats an expired one (expired = resets_at in the past). A payload
+#      still anchored to a window that ended was fetched before it ended, so anything anchored to
+#      the window that followed is newer — a fact that holds even for a session with no record yet.
+#   2. otherwise the later fetch wins; ties go to the live payload.
 # If the winner is itself expired, the window has rolled over: usage renders as 0% with no ↻,
 # because the next window's anchor is unknown until the next API response.
 # CLAUDE_SL_CACHE_DIR overrides the location (used by the test suite for isolation).
 rate_cache="${cache_dir}/claude-sl-rate"
 [ -n "$account" ] && rate_cache="${rate_cache}-${account}"
 
-# args: pct_a reset_a pct_b reset_b — leaves the fresher snapshot in _w_pct/_w_reset
-pick_window() {
-  local pa="$1" ra="$2" pb="$3" rb="$4"
-  [[ "$ra" =~ ^[0-9]+$ ]] || ra=0
-  [[ "$rb" =~ ^[0-9]+$ ]] || rb=0
-  local ia=0 ib=0
-  printf -v ia "%.0f" "${pa:-0}" 2>/dev/null
-  printf -v ib "%.0f" "${pb:-0}" 2>/dev/null
-  local ea=0 eb=0
-  (( ra > 0 && ra <= now_ts )) && ea=1
-  (( rb > 0 && rb <= now_ts )) && eb=1
-  _w_pct="$pa"; _w_reset="$ra"
-  if [ -z "$pa" ]; then
-    _w_pct="$pb"; _w_reset="$rb"
-  elif [ -n "$pb" ]; then
-    # Rule 2 only applies when the tied resets_at names a real window (> 0); with no reset info
-    # on either side, the live payload always wins over the file.
-    if (( (ea && !eb) || (rb == ra && ra > 0 && ib > ia) )); then
-      _w_pct="$pb"; _w_reset="$rb"
+# --- What did THIS session report last tick, and when was it fetched? ---
+# Record format: "<account>\037<5h%>\037<5h reset>\037<7d%>\037<7d reset>\037<fetched_at>".
+#   - no record yet              → first sight: fetched now (a new process prefetches its quota
+#                                  at startup, so its first numbers are genuinely fresh)
+#   - values changed             → fetched now, under the current account
+#   - unchanged, same account    → a replay; keep the recorded fetch time
+#   - unchanged, account changed → these numbers belong to the account this session was logged
+#                                  into when it fetched them. /login is global, so an idle session
+#                                  keeps replaying the previous account's limits: drop them —
+#                                  neither render nor publish them as the new account's.
+observed_at="$now_ts"
+seen_record=""
+[ -n "$session_id" ] && seen_record="${cache_dir}/claude-sl-seen-${session_id//[^A-Za-z0-9._-]/_}"
+if [ -n "$seen_record" ] && { [ -n "$five_hour_pct" ] || [ -n "$seven_day_pct" ]; }; then
+  seen_acct="" seen_5pct="" seen_5rst="" seen_7pct="" seen_7rst="" seen_at=""
+  if [ -f "$seen_record" ]; then
+    IFS=$'\037' read -r seen_acct seen_5pct seen_5rst seen_7pct seen_7rst seen_at < "$seen_record" 2>/dev/null
+  fi
+  if [ -f "$seen_record" ] && [ "$five_hour_pct" = "$seen_5pct" ] && [ "$five_hour_reset" = "$seen_5rst" ] \
+     && [ "$seven_day_pct" = "$seen_7pct" ] && [ "$seven_day_reset" = "$seen_7rst" ]; then
+    if [ "$seen_acct" = "$account" ]; then
+      [[ "$seen_at" =~ ^[0-9]+$ ]] && observed_at="$seen_at"
+    else
+      five_hour_pct=""; five_hour_reset=0; seven_day_pct=""; seven_day_reset=0
+    fi
+  else
+    # Temp files are dot-prefixed so they can never be globbed as an account snapshot below.
+    tmp_seen=$(mktemp "${cache_dir}/.claude-sl-seen.XXXXXX" 2>/dev/null)
+    if [ -n "$tmp_seen" ]; then
+      printf '%s\037%s\037%s\037%s\037%s\037%s' "$account" "$five_hour_pct" "$five_hour_reset" \
+        "$seven_day_pct" "$seven_day_reset" "$now_ts" > "$tmp_seen" && mv "$tmp_seen" "$seen_record"
     fi
   fi
-  # Winner already expired → the window rolled over; show a fresh (empty) window.
-  if [ -n "$_w_pct" ] && (( _w_reset > 0 && _w_reset <= now_ts )); then
-    _w_pct=0; _w_reset=0
-  fi
-}
+fi
 
-# Drop rate data that provably belongs to the account you just switched away from. Claude Code
-# holds rate limits in memory per process and only refreshes them when an API response comes back,
-# so after /login every already-running session keeps reporting the PREVIOUS account's numbers —
-# for as long as it sits idle. Such a payload is identical, to the second, to what that account
-# last published: same used% AND the same resets_at anchor. Windows are anchored per account at
-# first use, so two accounts genuinely sharing a reset second doesn't happen — the exact-anchor
-# match is what makes this safe to act on. Matching windows are dropped rather than believed, which
-# also keeps them from poisoning this account's snapshot; the moment a real response for the new
-# account arrives the values differ and the payload is trusted again. Each window is judged on its
-# own, so a stale weekly window can't suppress a freshly-updated session window.
+# Second guard for the same carry-over, covering a session that has no record yet (it started
+# under an older version of this script, or its record was cleaned out of $TMPDIR): a payload that
+# matches another account's snapshot exactly — same used% AND the same resets_at second — is that
+# account's data. Windows are anchored per account at first use, so two accounts never share a
+# reset second; the exact match is what makes this safe. Each window is judged on its own.
 for other in "${cache_dir}"/claude-sl-rate "${cache_dir}"/claude-sl-rate-*; do
   # Nothing left to vet once both windows have been dropped (or never arrived).
   [ -n "$five_hour_pct" ] || [ -n "$seven_day_pct" ] || break
   # Skip this account's own snapshot, and the unexpanded glob when no other account has one.
   [ -f "$other" ] && [ "$other" != "$rate_cache" ] || continue
   other_5pct="" other_5rst="" other_7pct="" other_7rst=""
-  IFS=$'\037' read -r other_5pct other_5rst other_7pct other_7rst < "$other" 2>/dev/null
+  IFS=$'\037' read -r other_5pct other_5rst other_7pct other_7rst _ < "$other" 2>/dev/null
   if [ -n "$five_hour_pct" ] && [ "$five_hour_pct" = "$other_5pct" ] \
      && [ "$five_hour_reset" = "$other_5rst" ] && [[ "$five_hour_reset" =~ ^[1-9][0-9]*$ ]]; then
     five_hour_pct=""; five_hour_reset=0
@@ -211,24 +217,52 @@ for other in "${cache_dir}"/claude-sl-rate "${cache_dir}"/claude-sl-rate-*; do
   fi
 done
 
-cached_5pct="" cached_5rst="" cached_7pct="" cached_7rst=""
+# args: pct_a reset_a seen_a pct_b reset_b seen_b — a is the live payload, b the shared snapshot.
+# Leaves the winner in _w_pct/_w_reset/_w_seen.
+pick_window() {
+  local pa="$1" ra="$2" ta="$3" pb="$4" rb="$5" tb="$6"
+  [[ "$ra" =~ ^[0-9]+$ ]] || ra=0
+  [[ "$rb" =~ ^[0-9]+$ ]] || rb=0
+  [[ "$ta" =~ ^[0-9]+$ ]] || ta=0
+  [[ "$tb" =~ ^[0-9]+$ ]] || tb=0
+  local ea=0 eb=0
+  (( ra > 0 && ra <= now_ts )) && ea=1
+  (( rb > 0 && rb <= now_ts )) && eb=1
+  _w_pct="$pa"; _w_reset="$ra"; _w_seen="$ta"
+  if [ -z "$pa" ]; then
+    _w_pct="$pb"; _w_reset="$rb"; _w_seen="$tb"
+  elif [ -n "$pb" ]; then
+    if (( (ea && !eb) || (ea == eb && tb > ta) )); then
+      _w_pct="$pb"; _w_reset="$rb"; _w_seen="$tb"
+    fi
+  fi
+  # Winner already expired → the window rolled over; show a fresh (empty) window.
+  if [ -n "$_w_pct" ] && (( _w_reset > 0 && _w_reset <= now_ts )); then
+    _w_pct=0; _w_reset=0
+  fi
+}
+
+# Snapshot format: "<5h%>\037<5h reset>\037<7d%>\037<7d reset>\037<5h fetched_at>\037<7d fetched_at>".
+# The fetch times trail so a file written by an older version (four fields) reads as fetched at
+# time 0 — older than anything live — instead of shifting the weekly fields.
+cached_5pct="" cached_5rst="" cached_7pct="" cached_7rst="" cached_5at="" cached_7at=""
 if [ -f "$rate_cache" ]; then
-  IFS=$'\037' read -r cached_5pct cached_5rst cached_7pct cached_7rst < "$rate_cache" 2>/dev/null
+  IFS=$'\037' read -r cached_5pct cached_5rst cached_7pct cached_7rst cached_5at cached_7at < "$rate_cache" 2>/dev/null
 fi
 payload_had_rate=""
 if [ -n "$five_hour_pct" ] || [ -n "$seven_day_pct" ]; then payload_had_rate=1; fi
-pick_window "$five_hour_pct" "$five_hour_reset" "$cached_5pct" "$cached_5rst"
-five_hour_pct="$_w_pct"; five_hour_reset="$_w_reset"
-pick_window "$seven_day_pct" "$seven_day_reset" "$cached_7pct" "$cached_7rst"
-seven_day_pct="$_w_pct"; seven_day_reset="$_w_reset"
+pick_window "$five_hour_pct" "$five_hour_reset" "$observed_at" "$cached_5pct" "$cached_5rst" "$cached_5at"
+five_hour_pct="$_w_pct"; five_hour_reset="$_w_reset"; five_hour_at="$_w_seen"
+pick_window "$seven_day_pct" "$seven_day_reset" "$observed_at" "$cached_7pct" "$cached_7rst" "$cached_7at"
+seven_day_pct="$_w_pct"; seven_day_reset="$_w_reset"; seven_day_at="$_w_seen"
 # Publish the merged snapshot only when this payload actually carried rate data — a data-less
-# tick (new session pre-first-response) must never rewrite the shared file it just read from.
-# Atomic mktemp+mv, same pattern as the git cache below.
+# tick (new session pre-first-response, or a dropped carry-over) must never rewrite the shared
+# file it just read from. Atomic mktemp+mv, same pattern as the git cache below.
 if [ -n "$payload_had_rate" ]; then
   tmp_rate=$(mktemp "${cache_dir}/.claude-sl-rate.XXXXXX" 2>/dev/null)
   if [ -n "$tmp_rate" ]; then
-    printf '%s\037%s\037%s\037%s' "$five_hour_pct" "$five_hour_reset" "$seven_day_pct" "$seven_day_reset" > "$tmp_rate" \
-      && mv "$tmp_rate" "$rate_cache"
+    printf '%s\037%s\037%s\037%s\037%s\037%s' "$five_hour_pct" "$five_hour_reset" "$seven_day_pct" "$seven_day_reset" \
+      "$five_hour_at" "$seven_day_at" > "$tmp_rate" && mv "$tmp_rate" "$rate_cache"
   fi
 fi
 

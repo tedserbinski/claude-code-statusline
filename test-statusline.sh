@@ -23,7 +23,7 @@ run_test() {
   local name="$1" json="$2"
   TOTAL=$((TOTAL + 1))
   local errors=""
-  rm -f "$RATE_CACHE" "$RATE_CACHE_B"
+  rm -f "$RATE_CACHE" "$RATE_CACHE_B" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
 
   # Capture stdout and stderr separately
   local stdout exit_code
@@ -316,17 +316,53 @@ else
   printf "  \033[31m✗\033[0m Stale session should show fresher 55%% with ↻ — output: %s\n" "$out"
 fi
 
-# --- Scenario 17e5: Same window — higher used%% wins regardless of write order ---
-rm -f "$RATE_CACHE"
-echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":70,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" >/dev/null 2>&1
-out=$(echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":30,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+# --- Scenario 17e5: A boosted or reset limit lowers used% in the SAME window — live data wins ---
+# Regression: the merge used to assume usage only grows within a window and kept the higher
+# percentage. Anthropic can raise a limit mid-window ("your limits are temporarily boosted") or
+# reset one, which lowers utilization without moving resets_at — the old rule then pinned a spent
+# window at 100% until it expired, while /usage showed 1%. A session whose numbers changed since
+# its last tick has a fresh API response, and that response is the truth.
+rm -f "$RATE_CACHE" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+echo "{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-1\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":70,\"resets_at\":${RESET_LIVE}},\"seven_day\":{\"used_percentage\":100,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" >/dev/null 2>&1
+out=$(echo "{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-1\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":30,\"resets_at\":${RESET_LIVE}},\"seven_day\":{\"used_percentage\":1,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 TOTAL=$((TOTAL + 1))
-if echo "$out" | grep -qF '⏱ 70%'; then
+if echo "$out" | grep -qF '⏱ 30%' && echo "$out" | grep -qF '⧖ 1%' && ! echo "$out" | grep -qF '100%'; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Same window: higher used%% (70%%) beats a lagging 30%%\n"
+  printf "  \033[32m✓\033[0m Boosted limit: live 30%%/1%% beats the cached 70%%/100%% in the same window\n"
 else
   FAIL=$((FAIL + 1))
-  printf "  \033[31m✗\033[0m Same-window merge should keep 70%% — output: %s\n" "$out"
+  printf "  \033[31m✗\033[0m Live data after a boost should win — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e5b: An idle session replaying old numbers does NOT overwrite fresher data ---
+# The flip side of 17e5: a session whose numbers are UNCHANGED since its last tick has no new
+# response, so its observation keeps its original fetch time and loses to anything newer. The
+# record is written directly with a fetch time in the past, because a real replay is separated
+# from the fresh publish by more than the one-second clock this suite runs inside.
+rm -f "$RATE_CACHE" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+printf 'acct-a\03730\037%s\037\0370\037%s' "$RESET_LIVE" "$(($(date +%s) - 600))" > "$CLAUDE_SL_CACHE_DIR/claude-sl-seen-sess-idle"
+echo "{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-2\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":70,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" >/dev/null 2>&1   # fresh session publishes
+out=$(echo "{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-idle\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":30,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ 70%' && grep -qF '70' "$RATE_CACHE"; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Idle session's replayed 30%% defers to the fresher 70%% (and doesn't publish it)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Idle replay should lose to fresher data — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e5c: A snapshot from an older script version (no fetch times) never pins ---
+rm -f "$RATE_CACHE" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+printf '100\037%s\037100\037%s' "$RESET_LIVE" "$RESET_LIVE" > "$RATE_CACHE"   # four-field legacy file
+out=$(echo "{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-3\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":5,\"resets_at\":${RESET_LIVE}},\"seven_day\":{\"used_percentage\":2,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ 5%' && echo "$out" | grep -qF '⧖ 2%'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Legacy four-field snapshot reads as oldest; live 5%%/2%% wins\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Legacy snapshot should never beat live data — output: %s\n" "$out"
 fi
 
 # --- Scenario 17e6: Live payload beats a cached snapshot with a mismatched (later) anchor ---
@@ -401,6 +437,49 @@ if echo "$out" | grep -qF '⏱ 63%' && echo "$out" | grep -qF '↻' && [ -f "$RA
 else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Fresh data for the new account was wrongly suppressed — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e11: Carry-over is caught by the session record even after the old account moves on ---
+# The exact-match guard (17e9) fails once the old account makes another call: its snapshot moves
+# to 65% while the idle session still replays 63%, so nothing matches any more. The per-session
+# record still knows those 63% were fetched under account A, so they must still be dropped.
+rm -f "$RATE_CACHE" "$RATE_CACHE_B" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+echo "{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-old\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":63,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" >/dev/null 2>&1   # sess-old fetches under A
+echo "{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-new\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":65,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" >/dev/null 2>&1   # A moves on to 65%
+out=$(echo "{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-old\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":63,\"resets_at\":${RESET_LIVE}}}}" | CLAUDE_SL_ACCOUNT=acct-b bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')   # sess-old replays under B
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ --' && [ ! -f "$RATE_CACHE_B" ]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Replay under a new account is attributed to the old one via the session record\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Session record should attribute the replay to account A — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e12: The same session's FIRST new response under the new account is trusted ---
+# Once sess-old actually makes a call as account B its numbers change, and from then on they are
+# B's: rendered, published to B's snapshot, and the record re-homed so later replays stay B's.
+out=$(echo "{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-old\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":12,\"resets_at\":$((RESET_LIVE + 900))}}}" | CLAUDE_SL_ACCOUNT=acct-b bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+out2=$(echo "{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-old\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":12,\"resets_at\":$((RESET_LIVE + 900))}}}" | CLAUDE_SL_ACCOUNT=acct-b bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')   # replay, now as B
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ 12%' && echo "$out2" | grep -qF '⏱ 12%' && grep -qF '12' "$RATE_CACHE_B" \
+   && grep -qF 'acct-b' "$CLAUDE_SL_CACHE_DIR/claude-sl-seen-sess-old"; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Session's first new response under account B is trusted and re-homes the record\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m New response under B should be trusted — output: %s / %s\n" "$out" "$out2"
+fi
+
+# --- Scenario 17e13: Account A's snapshot was not poisoned by any of the above ---
+out=$(echo '{"model":{"display_name":"x"}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ 65%'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Account A still shows its own 65%% after the switch dance\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Account A's snapshot was disturbed — output: %s\n" "$out"
 fi
 
 # --- Scenario 17f: Git cache isolation between repos ---
