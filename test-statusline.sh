@@ -15,7 +15,12 @@ CLAUDE_SL_CACHE_DIR=$(mktemp -d)
 export CLAUDE_SL_CACHE_DIR
 CLAUDE_SL_ACCOUNT="acct-a"
 export CLAUDE_SL_ACCOUNT
+# The OAuth usage endpoint is never called from the suite: fetching is off by default here, and
+# the fetch scenarios point CLAUDE_SL_USAGE_URL at a local fixture with a dummy token.
+CLAUDE_SL_USAGE_TTL=0
+export CLAUDE_SL_USAGE_TTL
 RATE_CACHE="$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-a"
+USAGE_CACHE="$CLAUDE_SL_CACHE_DIR/claude-sl-usage-acct-a"
 RATE_CACHE_B="$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-b"
 trap 'rm -rf "$CLAUDE_SL_CACHE_DIR"' EXIT
 
@@ -480,6 +485,77 @@ if echo "$out" | grep -qF '⏱ 65%'; then
 else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Account A's snapshot was disturbed — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e14: A boost while every session is idle arrives via the usage endpoint ---
+# Header-fed data can't move without an API call. The cached endpoint result is one more
+# timestamped observation: fetched more recently than the idle sessions' 100%, it wins.
+rm -f "$RATE_CACHE" "$USAGE_CACHE" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+NOW=$(date +%s)
+printf '90\037%s\037100\037%s\037%s\037%s' "$RESET_LIVE" "$RESET_LIVE" "$((NOW - 900))" "$((NOW - 900))" > "$RATE_CACHE"   # idle sessions, 15 min old
+printf '9\037%s\0371\037%s\037%s' "$RESET_LIVE" "$RESET_LIVE" "$((NOW - 60))" > "$USAGE_CACHE"                            # endpoint, 1 min old
+out=$(echo '{"model":{"display_name":"x"}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ 9%' && echo "$out" | grep -qF '⧖ 1%' && ! echo "$out" | grep -qF '100%'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Newer usage-endpoint result (9%%/1%%) beats idle sessions' 90%%/100%%\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Endpoint result should win while idle — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e15: A fresher header response beats an older endpoint result ---
+rm -f "$RATE_CACHE" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+printf '50\037%s\03740\037%s\037%s' "$RESET_LIVE" "$RESET_LIVE" "$((NOW - 300))" > "$USAGE_CACHE"   # endpoint, 5 min old
+out=$(echo "{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-hdr\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":20,\"resets_at\":${RESET_LIVE}},\"seven_day\":{\"used_percentage\":2,\"resets_at\":${RESET_LIVE}}}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ 20%' && echo "$out" | grep -qF '⧖ 2%'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Fresh header response (20%%/2%%) beats an older endpoint result\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Fresh headers should beat an older endpoint result — output: %s\n" "$out"
+fi
+
+# --- Scenario 17e16: The background fetch populates the endpoint cache without blocking ---
+# The URL points at a local fixture shaped like the real response (0–100 utilization, ISO
+# resets_at with fractional seconds and a +00:00 offset). The tick must return immediately;
+# the file appears shortly after, and the next tick renders from it. A fractional reset instant
+# is rounded UP to match the header anchor for the same window.
+rm -f "$RATE_CACHE" "$USAGE_CACHE" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+FIXTURE="$CLAUDE_SL_CACHE_DIR/usage-fixture.json"
+ISO_RESET=$(date -u -r "$RESET_LIVE" '+%Y-%m-%dT%H:%M:%S.774567+00:00')
+printf '{"five_hour":{"utilization":14.0,"resets_at":"%s"},"seven_day":{"utilization":3.0,"resets_at":"%s"},"extra_usage":{"utilization":null}}' "$ISO_RESET" "$ISO_RESET" > "$FIXTURE"
+start_ms=$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || echo 0)
+out=$(echo '{"model":{"display_name":"x"},"version":"9.9.9","session_id":"sess-fetch"}' | CLAUDE_SL_USAGE_TTL=1 CLAUDE_SL_USAGE_TOKEN=dummy CLAUDE_SL_USAGE_URL="file://$FIXTURE" bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+end_ms=$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || echo 0)
+for _ in $(seq 1 40); do [ -f "$USAGE_CACHE" ] && break; sleep 0.1; done
+out2=$(echo '{"model":{"display_name":"x"},"version":"9.9.9","session_id":"sess-fetch"}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+IFS=$'\037' read -r _ fx_5rst _ _ _ < "$USAGE_CACHE" 2>/dev/null
+TOTAL=$((TOTAL + 1))
+if echo "$out" | grep -qF '⏱ --' && [ -f "$USAGE_CACHE" ] && echo "$out2" | grep -qF '⏱ 14%' && echo "$out2" | grep -qF '⧖ 3%' \
+   && [ "$fx_5rst" = "$((RESET_LIVE + 1))" ] && [ $((end_ms - start_ms)) -lt 1000 ]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Background fetch fills the endpoint cache (14%%/3%%, reset rounded up) without blocking\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Background fetch failed — tick: %s / next: %s / reset: %s (want %s) / %sms\n" "$out" "$out2" "$fx_5rst" "$((RESET_LIVE + 1))" "$((end_ms - start_ms))"
+fi
+
+# --- Scenario 17e17: A failed fetch backs off instead of hammering the endpoint ---
+rm -f "$RATE_CACHE" "$USAGE_CACHE" "$USAGE_CACHE.err" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+echo '{"model":{"display_name":"x"},"version":"9.9.9","session_id":"sess-fail"}' | CLAUDE_SL_USAGE_TTL=1 CLAUDE_SL_USAGE_TOKEN=dummy CLAUDE_SL_USAGE_URL="file://$CLAUDE_SL_CACHE_DIR/missing.json" bash "$SCRIPT" >/dev/null 2>&1
+for _ in $(seq 1 40); do [ -f "$USAGE_CACHE.err" ] && break; sleep 0.1; done
+err_before=$(cat "$USAGE_CACHE.err" 2>/dev/null)
+echo '{"model":{"display_name":"x"},"version":"9.9.9","session_id":"sess-fail"}' | CLAUDE_SL_USAGE_TTL=1 CLAUDE_SL_USAGE_TOKEN=dummy CLAUDE_SL_USAGE_URL="file://$FIXTURE" bash "$SCRIPT" >/dev/null 2>&1   # would succeed, but must not run
+sleep 0.5
+TOTAL=$((TOTAL + 1))
+if [ -n "$err_before" ] && [ "$(cat "$USAGE_CACHE.err" 2>/dev/null)" = "$err_before" ] && [ ! -f "$USAGE_CACHE" ] && [ ! -d "$USAGE_CACHE.lock" ]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Failed fetch records a backoff marker and is not retried on the next tick\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Backoff after a failed fetch is broken — err: '%s'\n" "$(cat "$USAGE_CACHE.err" 2>/dev/null | tr '\037' '|')"
 fi
 
 # --- Scenario 17f: Git cache isolation between repos ---

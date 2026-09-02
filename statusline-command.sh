@@ -266,6 +266,119 @@ if [ -n "$payload_had_rate" ]; then
   fi
 fi
 
+# --- Authoritative usage from Anthropic's OAuth usage endpoint (what the /usage view shows) ---
+# The header-fed observations above can only change when some session makes an API call. If
+# every session is idle when Anthropic boosts or resets a limit, nothing updates until one of
+# them does. GET https://api.anthropic.com/api/oauth/usage is the source the /usage view reads —
+# it takes the OAuth token Claude Code already holds (macOS Keychain "Claude Code-credentials";
+# ~/.claude/.credentials.json elsewhere) and returns both windows as 0–100 percentages with ISO
+# reset times, which land within a second of the header anchors. Its result is simply one more
+# timestamped observation for pick_window, so the newest of {live payload, shared snapshot, API}
+# wins under the same two rules.
+# The call never blocks a tick: it runs detached in the background, and only when the newest
+# observation on hand is older than CLAUDE_SL_USAGE_TTL seconds (default 180 — this endpoint 429s
+# aggressively when polled faster; active sessions refresh from headers every turn, so in practice
+# it fires only while idle). One fetch per account at a time (mkdir lock), failures back off for
+# 10 minutes, and the result is cached per account. Set CLAUDE_SL_USAGE_TTL=0 to disable the
+# endpoint entirely; CLAUDE_SL_USAGE_TOKEN / CLAUDE_SL_USAGE_URL override the token and URL (the
+# test suite points the URL at a local fixture).
+usage_ttl="${CLAUDE_SL_USAGE_TTL-180}"
+[[ "$usage_ttl" =~ ^[0-9]+$ ]] || usage_ttl=180
+usage_file="${cache_dir}/claude-sl-usage"
+[ -n "$account" ] && usage_file="${usage_file}-${account}"
+api_5pct="" api_5rst="" api_7pct="" api_7rst="" api_at=""
+if [ -f "$usage_file" ]; then
+  IFS=$'\037' read -r api_5pct api_5rst api_7pct api_7rst api_at < "$usage_file" 2>/dev/null
+fi
+pick_window "$five_hour_pct" "$five_hour_reset" "$five_hour_at" "$api_5pct" "$api_5rst" "$api_at"
+five_hour_pct="$_w_pct"; five_hour_reset="$_w_reset"; five_hour_at="$_w_seen"
+pick_window "$seven_day_pct" "$seven_day_reset" "$seven_day_at" "$api_7pct" "$api_7rst" "$api_at"
+seven_day_pct="$_w_pct"; seven_day_reset="$_w_reset"; seven_day_at="$_w_seen"
+
+# Read the OAuth access token Claude Code is logged in with. Empty when unavailable or expired
+# (Claude Code refreshes an expired token on its next API call; until then there is nothing to do).
+read_oauth_token() {
+  _token="${CLAUDE_SL_USAGE_TOKEN-}"
+  [ -n "$_token" ] && return 0
+  local creds=""
+  if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+    creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+  fi
+  if [ -z "$creds" ]; then
+    local creds_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+    [ -r "$creds_file" ] && creds=$(cat "$creds_file" 2>/dev/null)
+  fi
+  [ -n "$creds" ] || return 1
+  _token=$(printf '%s' "$creds" | jq -r --argjson now_ms "$(( now_ts * 1000 ))" '
+    .claudeAiOauth
+    | if (.accessToken // "") != "" and ((.expiresAt // 0) == 0 or .expiresAt > $now_ms)
+      then .accessToken else "" end' 2>/dev/null)
+  [ -n "$_token" ]
+}
+
+# Fetch once, in the background. Writes "<5h%>\037<5h reset>\037<7d%>\037<7d reset>\037<fetched_at>"
+# to $usage_file on success, or "<http code>\037<time>" to $usage_file.err on failure.
+fetch_usage_in_background() {
+  local lock="${usage_file}.lock"
+  # mkdir is atomic: the first session to get it fetches, the rest skip. A lock older than a
+  # minute belongs to a fetch that died (killed mid-flight, machine slept) and is reclaimed.
+  if ! mkdir "$lock" 2>/dev/null; then
+    local lock_age=$(( now_ts - $(stat -f%m "$lock" 2>/dev/null || echo "$now_ts") ))
+    (( lock_age >= 60 )) || return 0
+    rm -rf "$lock" 2>/dev/null; mkdir "$lock" 2>/dev/null || return 0
+  fi
+  (
+    trap 'rm -rf "$lock"' EXIT
+    read_oauth_token || exit 0
+    local url="${CLAUDE_SL_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}"
+    local resp code body parsed
+    # User-Agent matters: without Claude Code's own UA the endpoint answers from a far stricter
+    # rate-limit bucket. The trailing http code is split off the body below.
+    resp=$(curl -sS -m 10 -w $'\n%{http_code}' \
+      -H "Authorization: Bearer ${_token}" \
+      -H "anthropic-beta: oauth-2025-04-20" \
+      -H "User-Agent: claude-code/${cc_version}" \
+      -H "Accept: application/json" "$url" 2>/dev/null)
+    code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+    # resets_at is ISO 8601 with fractional seconds and a +00:00 offset. jq's fromdateiso8601
+    # only reads "...SSZ", so strip the fraction and normalise the zero offset; any other offset
+    # (or a null) yields 0 = "no anchor". Round a fractional instant UP so it matches the header
+    # anchor for the same window (59.77s → :00) instead of rendering a minute earlier.
+    parsed=$(printf '%s' "$body" | jq -r '
+      def epoch: try (
+        capture("^(?<b>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.(?<f>[0-9]+))?(?<z>Z|\\+00:00)$") as $m
+        | ($m.b + "Z" | fromdateiso8601) + (if (($m.f // "0") | tonumber) > 0 then 1 else 0 end)
+      ) catch 0;
+      [ (.five_hour.utilization // ""), (.five_hour.resets_at | epoch),
+        (.seven_day.utilization // ""), (.seven_day.resets_at | epoch) ]
+      | map(tostring) | join("\u001f")' 2>/dev/null)
+    local fetched_at; fetched_at=$(date +%s)
+    if { [ "$code" = "200" ] || [ "$code" = "000" ]; } && [[ "$parsed" =~ ^[0-9] ]]; then
+      local tmp; tmp=$(mktemp "${cache_dir}/.claude-sl-usage.XXXXXX" 2>/dev/null) || exit 0
+      printf '%s\037%s' "$parsed" "$fetched_at" > "$tmp" && mv "$tmp" "$usage_file"
+      rm -f "${usage_file}.err"
+    else
+      printf '%s\037%s' "${code:-000}" "$fetched_at" > "${usage_file}.err" 2>/dev/null
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null
+}
+
+if (( usage_ttl > 0 )) && [ -n "$account" ] && [ -n "$cc_version" ]; then
+  newest_at=0
+  for t in "$five_hour_at" "$seven_day_at" "$api_at"; do
+    [[ "$t" =~ ^[0-9]+$ ]] && (( t > newest_at )) && newest_at="$t"
+  done
+  err_at=0
+  if [ -f "${usage_file}.err" ]; then
+    IFS=$'\037' read -r _ err_at < "${usage_file}.err" 2>/dev/null
+    [[ "$err_at" =~ ^[0-9]+$ ]] || err_at=0
+  fi
+  if (( now_ts - newest_at >= usage_ttl )) && (( now_ts - err_at >= 600 )); then
+    fetch_usage_in_background
+  fi
+fi
+
 # --- Git branch (cached for 5 seconds to avoid slow git calls) ---
 # Cache key includes cwd so concurrent sessions in different repos don't clash.
 # Using parameter expansion (not shasum) keeps this subprocess-free.
