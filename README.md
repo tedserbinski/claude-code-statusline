@@ -92,7 +92,7 @@ A test suite covering 56 checks (full payloads, boundary values, missing fields,
 bash ~/claude-statusline/test-statusline.sh
 ```
 
-Expected output ends with `All 47 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
+Expected output ends with `All 56 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
 
 ## Customization
 
@@ -127,7 +127,7 @@ Note that the symlink approach only works for Claude Code installed via the nati
 
 **Tests fail with multi-line output.** If the test suite reports `LINE COUNT: 2 lines (expected 1)`, something is emitting to stderr. Common cause: a jq type error on an unexpected field shape. Run the script manually with a sample payload and `2>&1 | cat -v` to see the error.
 
-**Progress bars show `⛁ --` and `⏱ --` instead of percentages.** This is normal before the first API response in a brand-new session — the `context_window.used_percentage` and `rate_limits.five_hour.used_percentage` fields aren't populated yet. Context always waits for the first message (it's per-conversation), but the rate bars inherit the last-known snapshot from any other recent session, so `⏱ --` only appears when that account has no published snapshot — right after a reboot (the snapshot lives in `$TMPDIR`), or right after switching accounts, since snapshots aren't shared between accounts. It fills in as soon as the new account gets its first API response.
+**Progress bars show `⛁ --` and `⏱ --` instead of percentages.** This is normal before the first API response in a brand-new session — the `context_window.used_percentage` and `rate_limits.five_hour.used_percentage` fields aren't populated yet. Context always waits for the first message (it's per-conversation), but the rate bars inherit the last-known snapshot from any other recent session on the same account, and failing that the background fetch from the usage endpoint fills them in within a few seconds of the first tick. `⏱ --` persisting means that fetch isn't working: the account has no published snapshot (right after a reboot, since the snapshot lives in `$TMPDIR`, or right after switching accounts) **and** the endpoint can't be reached — usually a token from `claude setup-token` (missing the `user:profile` scope; sign in with the browser flow), `CLAUDE_SL_USAGE_TTL=0`, or a `$TMPDIR/claude-sl-usage-<account>.err` backoff marker from a recent failure (delete it to retry immediately). It always fills in as soon as the account gets its first API response.
 
 **Version doesn't show.** The `version` field in the JSON payload was added in a recent Claude Code release. Older versions don't send it, and the script silently skips the section.
 
