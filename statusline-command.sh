@@ -379,75 +379,158 @@ if (( usage_ttl > 0 )) && [ -n "$account" ] && [ -n "$cc_version" ]; then
   fi
 fi
 
-# --- Git branch (cached for 5 seconds to avoid slow git calls) ---
+# --- Git branch + lines changed (cached; refreshed on a 5s TTL OR the moment the checkout moves) ---
 # Cache key includes cwd so concurrent sessions in different repos don't clash.
 # Using parameter expansion (not shasum) keeps this subprocess-free.
 # Atomic write via mktemp+mv prevents partial reads on concurrent ticks.
+#
+# Cache fields are separated by the ASCII Unit Separator (\037):
+#   "<branch>\037<worktree>\037<added>\037<removed>\037<gitdir>\037<head>\037<written_at>"
+# (worktree empty in the main checkout; added/removed/gitdir/head empty outside a git repo). It
+# must NOT be tab/space/newline: those are IFS-whitespace, and `read` collapses runs of
+# IFS-whitespace into a single delimiter — so an empty worktree field (the common case) would
+# vanish and shift <added> into the worktree slot (rendering a bogus "↳ 35"). \037 is a
+# non-whitespace delimiter that read keeps as a literal field boundary, preserving empties, and it
+# can never occur in a branch name, path, or count.
+#
+# <gitdir>/<head>/<written_at> exist so a cache HIT costs zero subprocesses and a branch switch is
+# picked up on the very next tick instead of up to 5s later (the way gitstatusd and starship key on
+# repo state rather than wall-clock): <head> is the literal content of $gitdir/HEAD ("ref: refs/
+# heads/x", or a hash when detached), which git rewrites on every checkout; and bash's builtin
+# `-nt` compares the index's mtime against the cache file's, which catches checkout/add/commit/
+# reset/stash without a stat(1) fork. Unstaged edits don't touch the index, so those still ride the
+# 5s TTL. --no-optional-locks on every git call below matters here: without it, `git diff` would
+# opportunistically rewrite the index after refreshing its stat cache and re-trigger us forever.
 git_branch=""
 git_worktree=""
 git_added=""
 git_removed=""
 if [ -n "$cwd" ]; then
   cache_file="${TMPDIR:-/tmp}/claude-sl-git${cwd//\//_}"
-  cache_age=999999999
+  c_gitdir=""; c_head=""; c_at=""
   if [ -f "$cache_file" ]; then
-    cache_age=$(( now_ts - $(stat -f%m "$cache_file" 2>/dev/null || echo 0) ))
+    IFS=$'\037' read -r git_branch git_worktree git_added git_removed c_gitdir c_head c_at < "$cache_file" 2>/dev/null
   fi
-  if [ "$cache_age" -ge 5 ]; then
-    if git -C "$cwd" rev-parse --git-dir > /dev/null 2>&1; then
-      git_branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null \
-        || git -C "$cwd" --no-optional-locks rev-parse --short HEAD 2>/dev/null)
+  [[ "$c_at" =~ ^[0-9]+$ ]] || c_at=0
+  refresh=0
+  if (( now_ts - c_at >= 5 )); then
+    refresh=1
+  elif [ -n "$c_gitdir" ]; then
+    head_now=""
+    [ -r "$c_gitdir/HEAD" ] && read -r head_now < "$c_gitdir/HEAD"
+    if [ "$head_now" != "$c_head" ] || [ "$c_gitdir/index" -nt "$cache_file" ]; then refresh=1; fi
+  fi
+  if [ "$refresh" = 1 ]; then
+    git_branch=""; git_worktree=""; git_added=""; git_removed=""
+    gitdir=""; toplevel=""; head_now=""
+    # ONE rev-parse answers "am I in a repo / where is the git-dir / where is the checkout root /
+    # what branch" (it used to be four calls). On an unborn branch the exit is non-zero but the
+    # first two lines still print; on unborn AND detached the branch line is the literal "HEAD".
+    { read -r gitdir; read -r toplevel; read -r git_branch; } < <(
+      git -C "$cwd" --no-optional-locks rev-parse --absolute-git-dir --show-toplevel --abbrev-ref HEAD 2>/dev/null)
+    if [ -n "$gitdir" ]; then
+      if [ -z "$git_branch" ] || [ "$git_branch" = "HEAD" ]; then
+        # Unborn (symbolic-ref still knows the branch name) or detached (short hash).
+        git_branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null \
+          || git -C "$cwd" --no-optional-locks rev-parse --short HEAD 2>/dev/null)
+      fi
+      [ -r "$gitdir/HEAD" ] && read -r head_now < "$gitdir/HEAD"
       # A linked worktree's git-dir is <repo>/.git/worktrees/<id>; the main worktree's isn't —
       # use that to detect "am I in a linked worktree?". But DON'T label with git's internal <id>:
       # git derives it by sanitizing/deduplicating the checkout basename, so it can degrade to a
       # bare "0", "-", "1", etc. on collision or special characters. Label with the checkout
       # directory's own name (via --show-toplevel) — the name the user actually recognizes.
-      gitdir=$(git -C "$cwd" --no-optional-locks rev-parse --absolute-git-dir 2>/dev/null)
       case "$gitdir" in
-        */worktrees/*)
-          wt_toplevel=$(git -C "$cwd" --no-optional-locks rev-parse --show-toplevel 2>/dev/null)
-          git_worktree="${wt_toplevel##*/}"
-          ;;
+        */worktrees/*) git_worktree="${toplevel##*/}" ;;
       esac
 
-      # Lines changed in THIS branch/worktree since it forked off the mainline: every line that
+      # Lines changed in THIS branch/worktree since it forked off its base: every line that
       # differs from the fork point (merge-base), committed AND uncommitted. We diff the working
       # tree against the merge-base commit (two-dot, not three-dot commit..commit) so staged +
       # unstaged edits to tracked files count alongside committed ones. Brand-new UNTRACKED files
       # are intentionally excluded — they'd otherwise pull in generated, non-gitignored dirs
       # (build output, tool indexes) and inflate the count; a new file lands here once you stage it.
       #
-      # Pick the fork point against the first mainline ref that actually exists and shares history:
-      # prefer the LOCAL main/master (what you branched from, and kept current), then the remote
-      # equivalents for a fresh clone/worktree that has no local mainline yet. If none yield a
-      # merge-base — e.g. you ARE on main, or an orphan branch — fall back to HEAD, which collapses
-      # the diff to "uncommitted changes only".
+      # The base is the newest point where this branch agrees with ANY of its candidate parents:
+      #   * the mainline refs (main/master, origin/HEAD for repos whose default branch is named
+      #     something else, and origin/main|master);
+      #   * for STACKED branches, the recorded parent — whichever tool recorded it: gh's
+      #     `branch.<b>.gh-merge-base`, git-town's `git-town-branch.<b>.parent`, Graphite's
+      #     `refs/branch-metadata/<b>` blob, or plain git's local upstream (`branch.<b>.remote=.`
+      #     + `branch.<b>.merge=refs/heads/<parent>`). Without this, a child branch would count
+      #     every line of its parent as its own.
+      # All candidates go into ONE `git merge-base HEAD a b c...` call: with 3+ args git returns
+      # the merge-base of HEAD and a *hypothetical merge of all the others*, i.e. the newest
+      # common ancestor with any of them. That is exactly what makes a STALE local main harmless —
+      # after `git merge origin/main` into a feature branch, merge-base(HEAD, main) is still the
+      # original fork point (so +86750/-122827 of upstream work looked like yours), but
+      # origin/main's is the merged tip, and the hypothetical merge picks it. Same for a stale
+      # parent: it's the child's tip after `git merge origin/parent`, or the mainline tip if the
+      # parent was merged and deleted. On main itself the base is HEAD, so only uncommitted lines
+      # count. Candidates that don't exist are dropped first (merge-base refuses unknown refs).
+      parent=""
+      if [ -n "$git_branch" ]; then
+        # ONE `git config` read covers gh, git-town and local-upstream at once. Keys are matched
+        # exactly in the loop (not in the regexp) so branch names with regex chars are safe.
+        up_remote=""; up_merge=""
+        while read -r key val; do
+          case "$key" in
+            "branch.${git_branch}.gh-merge-base") parent="$val" ;;
+            "git-town-branch.${git_branch}.parent") [ -n "$parent" ] || parent="$val" ;;
+            "branch.${git_branch}.remote") up_remote="$val" ;;
+            "branch.${git_branch}.merge") up_merge="$val" ;;
+          esac
+        done < <(git -C "$cwd" --no-optional-locks config --get-regexp \
+          '^(branch|git-town-branch)\..*\.(gh-merge-base|parent|remote|merge)$' 2>/dev/null)
+        # A local upstream (remote ".") is git's own way to say "this branch stacks on that one".
+        if [ -z "$parent" ] && [ "$up_remote" = "." ] && [ "${up_merge#refs/heads/}" != "$up_merge" ]; then
+          parent="${up_merge#refs/heads/}"
+        fi
+      fi
+      bases=()
+      gt_meta=""
+      # ONE for-each-ref tells us which candidate refs exist (it used to be a rev-parse --verify
+      # per candidate), and whether Graphite has metadata for this branch.
+      while read -r ref; do
+        case "$ref" in
+          refs/branch-metadata/*) gt_meta="$ref" ;;
+          "") ;;
+          *) bases+=("$ref") ;;
+        esac
+      done < <(git -C "$cwd" --no-optional-locks for-each-ref --format='%(refname)' \
+        refs/heads/main refs/heads/master refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master \
+        ${parent:+"refs/heads/$parent" "refs/remotes/origin/$parent"} \
+        ${git_branch:+"refs/branch-metadata/$git_branch"} 2>/dev/null)
+      if [ -z "$parent" ] && [ -n "$gt_meta" ]; then
+        # Graphite: the ref points at a JSON blob {"parentBranchName":"...", ...}. Only Graphite
+        # users pay for these two extra calls.
+        gt_json=$(git -C "$cwd" --no-optional-locks cat-file -p "$gt_meta" 2>/dev/null)
+        if [[ "$gt_json" =~ \"parentBranchName\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+          parent="${BASH_REMATCH[1]}"
+          while read -r ref; do
+            [ -n "$ref" ] && bases+=("$ref")
+          done < <(git -C "$cwd" --no-optional-locks for-each-ref --format='%(refname)' \
+            "refs/heads/$parent" "refs/remotes/origin/$parent" 2>/dev/null)
+        fi
+      fi
       diff_base="HEAD"
-      for cand in main master origin/HEAD origin/main origin/master; do
-        git -C "$cwd" --no-optional-locks rev-parse --verify --quiet "${cand}^{commit}" >/dev/null 2>&1 || continue
-        mb=$(git -C "$cwd" --no-optional-locks merge-base HEAD "$cand" 2>/dev/null)
-        if [ -n "$mb" ]; then diff_base="$mb"; break; fi
-      done
-      # numstat columns are <added>\t<removed>\t<path>; binary files report "-" for both, so skip
-      # those rather than summing a literal dash.
-      git_stats=$(git -C "$cwd" --no-optional-locks diff --numstat "$diff_base" 2>/dev/null \
-        | awk '{ if ($1 != "-") a += $1; if ($2 != "-") r += $2 } END { printf "%d\t%d", a, r }')
-      IFS=$'\t' read -r git_added git_removed <<< "$git_stats"
+      if [ "${#bases[@]}" -gt 0 ]; then
+        mb=$(git -C "$cwd" --no-optional-locks merge-base HEAD "${bases[@]}" 2>/dev/null)
+        [ -n "$mb" ] && diff_base="$mb"
+      fi
+      # --shortstat lets git do the summing (no awk fork); LC_ALL=C pins the English words we
+      # parse. Binary files aren't counted, and a clean tree prints nothing at all.
+      stat_line=$(LC_ALL=C git -C "$cwd" --no-optional-locks diff --shortstat "$diff_base" 2>/dev/null)
+      git_added=0; git_removed=0
+      [[ "$stat_line" =~ ([0-9]+)\ insertion ]] && git_added="${BASH_REMATCH[1]}"
+      [[ "$stat_line" =~ ([0-9]+)\ deletion ]] && git_removed="${BASH_REMATCH[1]}"
     fi
-    # Cache fields are separated by the ASCII Unit Separator (\037): "<branch>\037<worktree>\037
-    # <added>\037<removed>" (worktree empty in the main checkout; added/removed empty outside a git
-    # repo). It must NOT be tab/space/newline: those are IFS-whitespace, and `read` collapses runs
-    # of IFS-whitespace into a single delimiter — so an empty worktree field (the common case) would
-    # vanish and shift <added> into the worktree slot (rendering a bogus "↳ 35"). \037 is a
-    # non-whitespace delimiter that read keeps as a literal field boundary, preserving empties, and
-    # it can never occur in a branch name, path, or count.
     tmp_cache=$(mktemp "${cache_file}.XXXXXX" 2>/dev/null)
     if [ -n "$tmp_cache" ]; then
-      printf '%s\037%s\037%s\037%s' "$git_branch" "$git_worktree" "$git_added" "$git_removed" > "$tmp_cache" \
+      printf '%s\037%s\037%s\037%s\037%s\037%s\037%s' \
+        "$git_branch" "$git_worktree" "$git_added" "$git_removed" "$gitdir" "$head_now" "$now_ts" > "$tmp_cache" \
         && mv "$tmp_cache" "$cache_file"
     fi
-  else
-    IFS=$'\037' read -r git_branch git_worktree git_added git_removed < "$cache_file" 2>/dev/null
   fi
 fi
 

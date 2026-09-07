@@ -679,6 +679,106 @@ else
 fi
 rm -rf "$LR_BASE"
 
+# --- Scenario 17l: merging a newer origin/main into the branch does NOT count upstream lines ---
+# Regression: the fork point used to be merge-base(HEAD, local main) — first hit wins. When local
+# main is STALE (you never pulled it) and you `git merge origin/main` into your feature branch, that
+# merge-base is still the original fork point, so every upstream line merged in shows up as this
+# branch's work (+86750/-122827 on a clean tree). The fix takes the NEWEST merge-base across all
+# mainline refs — origin/main's merge-base is the merged tip. Build: origin with a big upstream
+# commit, a clone whose local main predates it, a feature branch with one +1 commit, then merge
+# origin/main. Expected: only the branch's own +1 line, none of the 100 upstream ones.
+UP_REMOTE=$(mktemp -d)
+UP_CLONE=$(mktemp -d)
+(
+  cd "$UP_REMOTE" || exit
+  git init -q -b main && git config user.email t@t.com && git config user.name t
+  printf 'a\n' > base.txt && git add . && git commit -qm init
+  cd "$UP_CLONE" || exit
+  git clone -q "$UP_REMOTE" . && git config user.email t@t.com && git config user.name t
+  git checkout -qb feature
+  printf 'a\nmine\n' > base.txt && git commit -qam mine                   # branch's own work: +1
+  # Upstream moves on with 100 lines while local main stays at init.
+  ( cd "$UP_REMOTE" && seq 1 100 > upstream.txt && git add . && git commit -qm upstream ) >/dev/null 2>&1
+  git fetch -q origin && git merge -q --no-edit origin/main                 # clean tree afterwards
+) >/dev/null 2>&1
+rm -f "${TMPDIR:-/tmp}/claude-sl-git${UP_CLONE//\//_}" 2>/dev/null
+out_up=$(echo "{\"workspace\":{\"current_dir\":\"$UP_CLONE\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out_up" | grep -qF '+1/-0'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Merging newer origin/main into the branch keeps upstream lines out of +N/-N\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Upstream merge inflated lines-since-fork — expected +1/-0 in: %s\n" "$out_up"
+fi
+rm -rf "$UP_REMOTE" "$UP_CLONE"
+
+# --- Scenario 17m: switching branches is reflected on the NEXT tick, not after the 5s TTL ---
+# The git cache used to be pure wall-clock (5s), so right after `git checkout other` the line kept
+# showing the previous branch's name and count. The cache now also stores $gitdir/HEAD's content
+# and compares the index mtime, so a checkout invalidates it immediately. Render on `big` (+50,
+# populates the cache), switch to `small` (+1), render again straight away: expect small's +1.
+SW_BASE=$(mktemp -d)
+(
+  cd "$SW_BASE" || exit
+  git init -q -b main && git config user.email t@t.com && git config user.name t
+  printf 'a\n' > f.txt && git add . && git commit -qm init
+  git checkout -qb small && printf 'a\nb\n' > f.txt && git commit -qam small
+  git checkout -qb big main && seq 1 50 > big.txt && git add . && git commit -qm big
+) >/dev/null 2>&1
+rm -f "${TMPDIR:-/tmp}/claude-sl-git${SW_BASE//\//_}" 2>/dev/null
+sw_json="{\"workspace\":{\"current_dir\":\"$SW_BASE\"},\"model\":{\"display_name\":\"x\"}}"
+out_sw_big=$(echo "$sw_json" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+git -C "$SW_BASE" checkout -q small >/dev/null 2>&1
+out_sw_small=$(echo "$sw_json" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out_sw_big" | grep -qF '+50/-0' && echo "$out_sw_small" | grep -qF '+1/-0' && echo "$out_sw_small" | grep -qF 'small'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Branch switch refreshes the cache on the next tick (no 5s lag)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Branch switch lagged — before: %s / after: %s\n" "$out_sw_big" "$out_sw_small"
+fi
+rm -rf "$SW_BASE"
+
+# --- Scenario 17n: stacked branches count only the child's lines, for every parent convention ---
+# A child branched off a feature branch (not main) used to count the parent's lines too, because
+# only mainline refs were fork-point candidates. The recorded parent is now a candidate as well,
+# whichever tool wrote it. Build main -> parent (+10 lines) -> child (+1 line); expect +1/-0 with
+# each of: gh (`branch.<b>.gh-merge-base`), git-town (`git-town-branch.<b>.parent`), Graphite
+# (`refs/branch-metadata/<b>` -> JSON blob), and plain git local upstream (remote "." + merge ref).
+# Also assert the no-metadata control shows +11 so the test can't pass vacuously.
+stack_check() {  # $1 = label, $2 = expected, $3... = setup commands run inside the repo
+  local label="$1" want="$2"; shift 2
+  local base out
+  base=$(mktemp -d)
+  (
+    cd "$base" || exit
+    git init -q -b main && git config user.email t@t.com && git config user.name t
+    printf 'a\n' > f.txt && git add . && git commit -qm init
+    git checkout -qb parent && seq 1 10 > parent.txt && git add . && git commit -qm parent
+    git checkout -qb child && printf 'a\nmine\n' > f.txt && git commit -qam child
+    for cmd in "$@"; do eval "$cmd"; done
+  ) >/dev/null 2>&1
+  rm -f "${TMPDIR:-/tmp}/claude-sl-git${base//\//_}" 2>/dev/null
+  out=$(echo "{\"workspace\":{\"current_dir\":\"$base\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+  TOTAL=$((TOTAL + 1))
+  if echo "$out" | grep -qF "$want"; then
+    PASS=$((PASS + 1))
+    printf "  \033[32m✓\033[0m Stacked branch (%s) shows %s\n" "$label" "$want"
+  else
+    FAIL=$((FAIL + 1))
+    printf "  \033[31m✗\033[0m Stacked branch (%s) — expected %s in: %s\n" "$label" "$want" "$out"
+  fi
+  rm -rf "$base"
+}
+stack_check "no parent recorded — control"  '+11/-0'
+stack_check "gh-merge-base"                  '+1/-0' 'git config branch.child.gh-merge-base parent'
+stack_check "git-town parent"                '+1/-0' 'git config git-town-branch.child.parent parent'
+stack_check "Graphite branch-metadata"       '+1/-0' \
+  'blob=$(printf "{\"parentBranchName\":\"parent\",\"parentBranchRevision\":\"x\"}" | git hash-object -w --stdin) && git update-ref refs/branch-metadata/child "$blob"'
+stack_check "local upstream (remote .)"      '+1/-0' 'git branch --set-upstream-to=parent child'
+
 # --- Scenario 17k: clean tree (no changes since fork) hides the +N/-N segment ---
 CL_BASE=$(mktemp -d)
 (
