@@ -778,6 +778,41 @@ stack_check "git-town parent"                '+1/-0' 'git config git-town-branch
 stack_check "Graphite branch-metadata"       '+1/-0' \
   'blob=$(printf "{\"parentBranchName\":\"parent\",\"parentBranchRevision\":\"x\"}" | git hash-object -w --stdin) && git update-ref refs/branch-metadata/child "$blob"'
 stack_check "local upstream (remote .)"      '+1/-0' 'git branch --set-upstream-to=parent child'
+# No tool metadata, but the child was created WITH an explicit start point, so git's own reflog says
+# "branch: Created from parent". Recreate child that way (the helper's `checkout -b child` logs
+# "Created from HEAD", which is why the control above still shows +11).
+stack_check "reflog 'Created from parent'"  '+1/-0' \
+  'git checkout -q parent && git branch -qD child && git checkout -qb child parent && printf "a\nmine\n" > f.txt && git commit -qam child'
+# Stacked AND main merged in: the child now has two best merge-bases (parent tip, main tip). Picking
+# either one alone counts the other side's lines; diffing against their merge counts only +1.
+stack_check "parent + merged main (two bases)" '+1/-0' \
+  'git config branch.child.gh-merge-base parent' \
+  'git checkout -q main && seq 1 20 > main.txt && git add . && git commit -qm main-moves && git checkout -q child && git merge -q --no-edit main'
+
+# --- Scenario 17o: a linked worktree whose branch was created from a feature branch ---
+# `git worktree add -b child <path> parent` writes the "Created from parent" reflog entry into the
+# COMMON git-dir, not the worktree's private one — the lookup must follow $gitdir/commondir.
+WT_MAIN=$(mktemp -d); WT_DIR="$(mktemp -d)/wt"
+(
+  cd "$WT_MAIN" || exit
+  git init -q -b main && git config user.email t@t.com && git config user.name t
+  printf 'a\n' > f.txt && git add . && git commit -qm init
+  git checkout -qb parent && seq 1 10 > parent.txt && git add . && git commit -qm parent
+  git checkout -q main
+  git worktree add -q -b child "$WT_DIR" parent
+  cd "$WT_DIR" && printf 'a\nmine\n' > f.txt && git commit -qam child
+) >/dev/null 2>&1
+rm -f "${TMPDIR:-/tmp}/claude-sl-git${WT_DIR//\//_}" 2>/dev/null
+out_wt=$(echo "{\"workspace\":{\"current_dir\":\"$WT_DIR\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+TOTAL=$((TOTAL + 1))
+if echo "$out_wt" | grep -qF '+1/-0'; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Worktree branch created from a feature branch counts only its own lines\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Worktree stacked on a feature branch — expected +1/-0 in: %s\n" "$out_wt"
+fi
+rm -rf "$WT_MAIN" "${WT_DIR%/wt}"
 
 # --- Scenario 17k: clean tree (no changes since fork) hides the +N/-N segment ---
 CL_BASE=$(mktemp -d)

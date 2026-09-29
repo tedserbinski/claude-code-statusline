@@ -487,6 +487,31 @@ if [ -n "$cwd" ]; then
           parent="${up_merge#refs/heads/}"
         fi
       fi
+      # No tool recorded a parent? Git itself usually did: the branch's first reflog entry reads
+      # "branch: Created from <start-point>" when it was made with an explicit start point
+      # (`git checkout -b child parent`, `git worktree add -b child <path> parent`). Read with
+      # builtins, no subprocess. Branch refs' reflogs live in the COMMON git-dir, not a linked
+      # worktree's private one. "Created from HEAD" (no start point given) tells us nothing, so it's
+      # skipped. It's a fallback candidate, kept apart from $parent so Graphite still gets its turn.
+      created_from=""
+      if [ -z "$parent" ] && [ -n "$git_branch" ]; then
+        common="$gitdir"
+        if [ -r "$gitdir/commondir" ]; then
+          read -r common < "$gitdir/commondir"
+          [ "${common#/}" = "$common" ] && common="$gitdir/$common"
+        fi
+        first_log=""
+        [ -r "$common/logs/refs/heads/$git_branch" ] && read -r first_log < "$common/logs/refs/heads/$git_branch"
+        if [[ "$first_log" == *$'\t'"branch: Created from "* ]]; then
+          created_from="${first_log#*$'\t'branch: Created from }"
+          created_from="${created_from#refs/heads/}"
+          created_from="${created_from#refs/remotes/}"
+          created_from="${created_from#origin/}"
+          case "$created_from" in
+            HEAD|"$git_branch"|main|master) created_from="" ;;
+          esac
+        fi
+      fi
       bases=()
       gt_meta=""
       # ONE for-each-ref tells us which candidate refs exist (it used to be a rev-parse --verify
@@ -500,6 +525,7 @@ if [ -n "$cwd" ]; then
       done < <(git -C "$cwd" --no-optional-locks for-each-ref --format='%(refname)' \
         refs/heads/main refs/heads/master refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master \
         ${parent:+"refs/heads/$parent" "refs/remotes/origin/$parent"} \
+        ${created_from:+"refs/heads/$created_from" "refs/remotes/origin/$created_from"} \
         ${git_branch:+"refs/branch-metadata/$git_branch"} 2>/dev/null)
       if [ -z "$parent" ] && [ -n "$gt_meta" ]; then
         # Graphite: the ref points at a JSON blob {"parentBranchName":"...", ...}. Only Graphite
@@ -515,8 +541,24 @@ if [ -n "$cwd" ]; then
       fi
       diff_base="HEAD"
       if [ "${#bases[@]}" -gt 0 ]; then
-        mb=$(git -C "$cwd" --no-optional-locks merge-base HEAD "${bases[@]}" 2>/dev/null)
-        [ -n "$mb" ] && diff_base="$mb"
+        # --all: a stacked branch that ALSO merged main in has two best common ancestors — the
+        # parent's tip and main's tip, neither containing the other. Plain merge-base picks one
+        # arbitrarily, and the diff then counts the other side's lines as ours (+7192 instead of
+        # +54 in a real repo). What we want is "both sides merged", so diff against the tree
+        # `merge-tree` builds from the two (git >= 2.38; its first output line is the tree id, even
+        # on conflict — conflicted files then carry markers, a small over-count we accept). This
+        # extra call happens only in the multi-base case; on older git we fall back to one base.
+        mbs=()
+        while read -r ref; do [ -n "$ref" ] && mbs+=("$ref"); done < <(
+          git -C "$cwd" --no-optional-locks merge-base --all HEAD "${bases[@]}" 2>/dev/null)
+        if [ "${#mbs[@]}" -gt 0 ]; then
+          diff_base="${mbs[0]}"
+          if [ "${#mbs[@]}" -gt 1 ]; then
+            mt=""
+            read -r mt < <(git -C "$cwd" --no-optional-locks merge-tree --write-tree "${mbs[0]}" "${mbs[1]}" 2>/dev/null)
+            [[ "$mt" =~ ^[0-9a-f]{40,64}$ ]] && diff_base="$mt"
+          fi
+        fi
       fi
       # --shortstat lets git do the summing (no awk fork); LC_ALL=C pins the English words we
       # parse. Binary files aren't counted, and a clean tree prints nothing at all.
