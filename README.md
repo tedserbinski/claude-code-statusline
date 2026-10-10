@@ -4,7 +4,20 @@ A compact, two-row statusline for [Claude Code](https://claude.com/claude-code) 
 
 ## Screenshot
 
-![Example screenshot in Ghostty](screenshot.png).
+![Two-row statusline in Ghostty: model, effort, fast mode and output style, then folder, worktree, branch and lines changed; below, context, 5-hour and weekly usage bars, the session's messaging name, and a pending update](screenshot.png)
+
+Every optional element is on in this shot: fast mode, a non-default output style (`☰Learning`), a linked worktree (`↳ feat-wt`), a weekly window past 80% (red), and a pending Claude Code update.
+
+## Layout
+
+```
+◆ Opus 5.5 medium fast ☰Learning · ~/Projects/Github/repo ↳ feat-wt ⎇ feat/branch · +412/-142
+⛁ 26% ⣿⣿⣿⣀⣀⣀⣀⣀⣀⣀ · ⏱ 53% ⣿⣿⣿⣿⣿⣀⣀⣀⣀⣀ ↻6:30pm · ⧖ 84% ⣿⣿⣿⣿⣿⣿⣿⣿⣀⣀ ↻Oct 14 · @repo-d4 · v2.1.297 ↑
+```
+
+- **Top row — what and where:** the model with its effort level, fast mode and output style, then the folder, worktree, branch, and lines changed on the branch.
+- **Bottom row — how much is left:** context, the 5-hour and weekly rate windows with their reset times, then reference info: the name other sessions message this one by, and a Claude Code update waiting for a restart.
+- A blank row follows, separating the statusline from Claude Code's own footer (permission mode, shells, agents, the PR link).
 
 ## Features
 
@@ -122,7 +135,7 @@ The script detects an installed-but-not-running Claude Code update by comparing 
 1. **Running version** — read from the `version` field of the JSON payload that Claude Code pipes to the script's stdin.
 2. **Installed version** — read from the target of the `claude` binary symlink. Claude Code's installer creates `~/.local/bin/claude` as a symlink pointing at `~/.local/share/claude/versions/<version>/`, so the version number is literally the last path component of the symlink target.
 
-Reading the symlink is a single `readlinkat()` syscall (<1ms), so it runs on every tick with no cache — keeping it cache-free means the indicator appears as soon as Claude Code auto-updates mid-session, and disappears once you restart into the new version.
+The common case costs no subprocess at all: a builtin `-ef` test checks whether the symlink already resolves to `versions/<running version>`, and only a mismatch runs `readlink` to learn the installed version's name. It runs on every tick with no cache — keeping it cache-free means the indicator appears as soon as Claude Code auto-updates mid-session, and disappears once you restart into the new version.
 
 If the running and installed versions differ, `update_available` is set and the statusline ends with a green `v<installed> ↑` — the version you'll be on after restarting Claude Code. While they match, no version is shown at all.
 
@@ -142,7 +155,7 @@ Note that the symlink approach only works for Claude Code installed via the nati
 
 **Progress bars show `⛁ --` and `⏱ --` instead of percentages.** This is normal before the first API response in a brand-new session — the `context_window.used_percentage` and `rate_limits.five_hour.used_percentage` fields aren't populated yet. Context always waits for the first message (it's per-conversation), but the rate bars inherit the last-known snapshot from any other recent session on the same account, and failing that the background fetch from the usage endpoint fills them in within a few seconds of the first tick. `⏱ --` persisting means that fetch isn't working: the account has no published snapshot (right after a reboot, since the snapshot lives in `$TMPDIR`, or right after switching accounts) **and** the endpoint can't be reached — usually a token from `claude setup-token` (missing the `user:profile` scope; sign in with the browser flow), `CLAUDE_SL_USAGE_TTL=0`, or a `$TMPDIR/claude-sl-usage-<account>.err` backoff marker from a recent failure (delete it to retry immediately). It always fills in as soon as the account gets its first API response.
 
-**Version doesn't show.** The `version` field in the JSON payload was added in a recent Claude Code release. Older versions don't send it, and the script silently skips the section.
+**Version doesn't show.** That's by design: the version only appears, as `v<installed> ↑`, when a newer Claude Code is installed than the one running. Restart Claude Code and it disappears again. Very old Claude Code versions don't send the `version` field at all, so no update can be detected there.
 
 **Update indicator never appears.** Check that `~/.local/bin/claude` is a symlink: `readlink ~/.local/bin/claude`. If it returns an absolute path containing the version, the indicator should work. If it returns nothing or the file isn't a symlink, you likely installed Claude Code through a package manager and the detection won't work.
 
