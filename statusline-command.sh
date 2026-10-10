@@ -32,7 +32,6 @@ C_LAVENDER="\033[38;5;147m"
 C_BLUE="\033[38;5;75m"
 C_SKY="\033[38;5;117m"
 C_ORANGE="\033[38;5;173m"
-C_DIM_WHITE="\033[38;5;250m"
 C_FAINT="\033[38;5;240m"     # structure, not content: the · separators and the bars' empty track
 C_RESET="\033[0m"
 
