@@ -1045,6 +1045,18 @@ else
 fi
 rm -rf "$prune_dir"
 
+# --- Scenario 16i: Backslashes in content are printed literally, never as escapes ---
+# A folder named "bs\cut" used to cut the whole statusline off at the \c (printf %b on content).
+TOTAL=$((TOTAL + 1))
+out=$(printf '%s' '{"workspace":{"current_dir":"/tmp/bs\\cut/x\\n"},"model":{"display_name":"Claude Opus 5.5"},"output_style":"a\\tb","context_window":{"used_percentage":10}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+if [[ "$out" == '◆ Opus 5.5 ☰a\tb · /tmp/bs\cut/x\n'$'\n''⛁ 10% '* ]]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Backslashes in paths and names render literally\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Backslash content mangled — output: %q\n" "$out"
+fi
+
 # --- Scenario 17: Rapid redraw (consistency) ---
 echo ""
 echo "  Rapid redraw test (20 iterations)..."

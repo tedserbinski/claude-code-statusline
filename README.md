@@ -99,7 +99,7 @@ A test suite covering 66 checks (full payloads, boundary values, missing fields,
 bash ~/claude-statusline/test-statusline.sh
 ```
 
-Expected output ends with `All 75 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
+Expected output ends with `All 76 tests passed ✓`. If any test fails, the output line count or stderr leakage is almost always the cause — see the "Troubleshooting" section below.
 
 ## Customization
 

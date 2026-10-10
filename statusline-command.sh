@@ -22,19 +22,23 @@ file_mtime() { stat -f%m "$1" 2>/dev/null || stat -c%Y "$1" 2>/dev/null; }
 # --- ANSI colors ---
 # Green / yellow / red mean "how much is used" (plus git's +added/-removed), so a yellow gauge
 # never reads like the folder or model name. Row 1's location is a sky-blue folder, thistle-pink
-# worktree and lavender branch, the model is Claude's terracotta, and the session's messaging name is link blue — it's
-# the address other sessions use (no green in either blue, so neither reads like the +added count).
-C_GREEN="\033[32m"
-C_YELLOW="\033[33m"
-C_RED="\033[31m"
-C_GREY="\033[38;5;245m"
-C_LAVENDER="\033[38;5;147m"
-C_BLUE="\033[38;5;75m"
-C_SKY="\033[38;5;117m"
-C_ORANGE="\033[38;5;173m"
-C_THISTLE="\033[38;5;182m"
-C_FAINT="\033[38;5;240m"     # structure, not content: the · separators and the bars' empty track
-C_RESET="\033[0m"
+# worktree and lavender branch, and the model is Claude's terracotta. The session's messaging name
+# is link blue — it's the address other sessions use. Neither blue has green in it, so neither
+# reads like the +added count.
+# The codes are real ESC bytes ($'…'), and the output is printed with %s: content (paths, branch
+# and style names) is never run through printf's %b, where a folder named "a\cb" would cut the
+# statusline off at the \c.
+C_GREEN=$'\033[32m'
+C_YELLOW=$'\033[33m'
+C_RED=$'\033[31m'
+C_GREY=$'\033[38;5;245m'
+C_LAVENDER=$'\033[38;5;147m'
+C_BLUE=$'\033[38;5;75m'
+C_SKY=$'\033[38;5;117m'
+C_ORANGE=$'\033[38;5;173m'
+C_THISTLE=$'\033[38;5;182m'
+C_FAINT=$'\033[38;5;240m'     # structure, not content: the · separators and the bars' empty track
+C_RESET=$'\033[0m'
 
 # --- Progress bar helpers (set variables, no subshells) ---
 # Sets _bar_result (colored bar) and _pct_color (the same threshold color, for the % text).
@@ -81,7 +85,7 @@ build_rate_segment() {
     if (( reset_ts > now_ts && reset_ts - now_ts <= window )); then
       # Within 24h → clock time (%l:%M%p), even across midnight; further out → month/day (%b %e).
       # The choice is by time-to-reset, NOT calendar date — a 5h window resetting at 1am tomorrow
-      # should read "1:10am", not "May 27". Both formats produced in one `date` call.
+      # should read "1:10am", not "May 27". Both formats come from one formatting call:
       # bash 4.2+ formats the time itself (printf %(…)T — no fork, and portable: GNU date's -r
       # means "a file's mtime", not "this epoch"). Stock macOS bash 3.2 falls back to BSD date -r.
       local fmt
@@ -100,12 +104,11 @@ build_rate_segment() {
 }
 
 # --- Extract all fields in a single jq call ---
-eval "$(echo "$input" | jq -r '
+eval "$(jq -r '
   @sh "cwd=\(.workspace.current_dir // .cwd // "")",
   @sh "model=\(.model.display_name // "")",
   @sh "ctx_pct=\(.context_window.used_percentage // "")",
   @sh "output_style=\((.output_style | if type == "object" then .name // "" else . // "" end))",
-  @sh "session_name=\(.session_name // "")",
   @sh "session_id=\(.session_id // "")",
   @sh "effort=\((.effort | if type == "object" then .level else . end) // .effortLevel // .effort_level // "")",
   @sh "five_hour_pct=\(.rate_limits.five_hour.used_percentage // "")",
@@ -114,12 +117,25 @@ eval "$(echo "$input" | jq -r '
   @sh "seven_day_reset=\(.rate_limits.seven_day.resets_at // 0)",
   @sh "cc_version=\(.version // "")",
   @sh "fast_mode=\(if .fast_mode == true then "1" else "" end)"
-')"
+' <<< "$input")"
 model="${model#Claude }"
 # Compact any "(1M context)" / "(200K context)" annotation to just the size token, so every
 # model name stays short regardless of tier: "Opus 4.7 (1M context)" → "Opus 4.7 1M".
 if [[ "$model" =~ ^(.+)\ \(([0-9]+[KMkm])\ context\)$ ]]; then
   model="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+fi
+
+# --- Cache directory ---
+# Every cache below lives here. macOS's $TMPDIR is already per-user; on Linux it's usually unset and
+# /tmp is shared by every user, so the caches get a private per-uid directory there (created once,
+# mode 700). CLAUDE_SL_CACHE_DIR overrides it (the test suite uses this for isolation).
+if [ -n "${CLAUDE_SL_CACHE_DIR-}" ]; then
+  cache_dir="$CLAUDE_SL_CACHE_DIR"
+elif [ -n "${TMPDIR-}" ]; then
+  cache_dir="${TMPDIR%/}"
+else
+  cache_dir="/tmp/claude-sl-${UID:-$(id -u)}"
+  [ -d "$cache_dir" ] || mkdir -m 700 "$cache_dir" 2>/dev/null || cache_dir="/tmp"
 fi
 
 # --- Which Claude account is logged in? ---
@@ -133,16 +149,6 @@ fi
 # CLAUDE_SL_ACCOUNT pins the id explicitly (used by the test suite). An unknown account — logged
 # out, or API-key auth, which has no subscription rate limits at all — falls back to the
 # unsuffixed snapshot, which is also what installs that predate this keying already use.
-# macOS's $TMPDIR is already per-user; on Linux it's usually unset and /tmp is shared by every
-# user, so the caches get a private per-uid directory there (created once, mode 700).
-if [ -n "${CLAUDE_SL_CACHE_DIR-}" ]; then
-  cache_dir="$CLAUDE_SL_CACHE_DIR"
-elif [ -n "${TMPDIR-}" ]; then
-  cache_dir="${TMPDIR%/}"
-else
-  cache_dir="/tmp/claude-sl-${UID:-$(id -u)}"
-  [ -d "$cache_dir" ] || mkdir -m 700 "$cache_dir" 2>/dev/null || cache_dir="/tmp"
-fi
 account="${CLAUDE_SL_ACCOUNT-}"
 if [ -z "${CLAUDE_SL_ACCOUNT+set}" ]; then
   # Record format: "<checked_at>\037<account>". The check time lives in the file so its age costs a
@@ -416,7 +422,7 @@ fi
 # --- Git branch + lines changed (cached; refreshed on a 5s TTL OR the moment the checkout moves) ---
 # Cache key includes cwd so concurrent sessions in different repos don't clash.
 # Using parameter expansion (not shasum) keeps this subprocess-free.
-# Atomic write via mktemp+mv prevents partial reads on concurrent ticks.
+# Atomic write (PID-named temp file + mv) prevents partial reads on concurrent ticks.
 #
 # Cache fields are separated by the ASCII Unit Separator (\037):
 #   "<branch>\037<worktree>\037<added>\037<removed>\037<gitdir>\037<head>\037<written_at>"
@@ -433,8 +439,10 @@ fi
 # heads/x", or a hash when detached), which git rewrites on every checkout; and bash's builtin
 # `-nt` compares the index's mtime against the cache file's, which catches checkout/add/commit/
 # reset/stash without a stat(1) fork. Unstaged edits don't touch the index, so those still ride the
-# 5s TTL. --no-optional-locks on every git call below matters here: without it, `git diff` would
-# opportunistically rewrite the index after refreshing its stat cache and re-trigger us forever.
+# 5s TTL. GIT_OPTIONAL_LOCKS=0 (git's env form of --no-optional-locks, covering every call below)
+# matters here: without it, `git diff` would opportunistically rewrite the index after refreshing
+# its stat cache and re-trigger us forever.
+export GIT_OPTIONAL_LOCKS=0
 git_branch=""
 git_worktree=""
 git_added=""
@@ -461,12 +469,12 @@ if [ -n "$cwd" ]; then
     # what branch" (it used to be four calls). On an unborn branch the exit is non-zero but the
     # first two lines still print; on unborn AND detached the branch line is the literal "HEAD".
     { read -r gitdir; read -r toplevel; read -r git_branch; } < <(
-      git -C "$cwd" --no-optional-locks rev-parse --absolute-git-dir --show-toplevel --abbrev-ref HEAD 2>/dev/null)
+      git -C "$cwd" rev-parse --absolute-git-dir --show-toplevel --abbrev-ref HEAD 2>/dev/null)
     if [ -n "$gitdir" ]; then
       if [ -z "$git_branch" ] || [ "$git_branch" = "HEAD" ]; then
         # Unborn (symbolic-ref still knows the branch name) or detached (short hash).
-        git_branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null \
-          || git -C "$cwd" --no-optional-locks rev-parse --short HEAD 2>/dev/null)
+        git_branch=$(git -C "$cwd" symbolic-ref --short HEAD 2>/dev/null \
+          || git -C "$cwd" rev-parse --short HEAD 2>/dev/null)
       fi
       [ -r "$gitdir/HEAD" ] && read -r head_now < "$gitdir/HEAD"
       # A linked worktree's git-dir is <repo>/.git/worktrees/<id>; the main worktree's isn't —
@@ -514,7 +522,7 @@ if [ -n "$cwd" ]; then
             "branch.${git_branch}.remote") up_remote="$val" ;;
             "branch.${git_branch}.merge") up_merge="$val" ;;
           esac
-        done < <(git -C "$cwd" --no-optional-locks config --get-regexp \
+        done < <(git -C "$cwd" config --get-regexp \
           '^(branch|git-town-branch)\..*\.(gh-merge-base|parent|remote|merge)$' 2>/dev/null)
         # A local upstream (remote ".") is git's own way to say "this branch stacks on that one".
         if [ -z "$parent" ] && [ "$up_remote" = "." ] && [ "${up_merge#refs/heads/}" != "$up_merge" ]; then
@@ -556,7 +564,7 @@ if [ -n "$cwd" ]; then
           "") ;;
           *) bases+=("$ref") ;;
         esac
-      done < <(git -C "$cwd" --no-optional-locks for-each-ref --format='%(refname)' \
+      done < <(git -C "$cwd" for-each-ref --format='%(refname)' \
         refs/heads/main refs/heads/master refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master \
         ${parent:+"refs/heads/$parent" "refs/remotes/origin/$parent"} \
         ${created_from:+"refs/heads/$created_from" "refs/remotes/origin/$created_from"} \
@@ -564,12 +572,12 @@ if [ -n "$cwd" ]; then
       if [ -z "$parent" ] && [ -n "$gt_meta" ]; then
         # Graphite: the ref points at a JSON blob {"parentBranchName":"...", ...}. Only Graphite
         # users pay for these two extra calls.
-        gt_json=$(git -C "$cwd" --no-optional-locks cat-file -p "$gt_meta" 2>/dev/null)
+        gt_json=$(git -C "$cwd" cat-file -p "$gt_meta" 2>/dev/null)
         if [[ "$gt_json" =~ \"parentBranchName\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
           parent="${BASH_REMATCH[1]}"
           while read -r ref; do
             [ -n "$ref" ] && bases+=("$ref")
-          done < <(git -C "$cwd" --no-optional-locks for-each-ref --format='%(refname)' \
+          done < <(git -C "$cwd" for-each-ref --format='%(refname)' \
             "refs/heads/$parent" "refs/remotes/origin/$parent" 2>/dev/null)
         fi
       fi
@@ -584,19 +592,19 @@ if [ -n "$cwd" ]; then
         # extra call happens only in the multi-base case; on older git we fall back to one base.
         mbs=()
         while read -r ref; do [ -n "$ref" ] && mbs+=("$ref"); done < <(
-          git -C "$cwd" --no-optional-locks merge-base --all HEAD "${bases[@]}" 2>/dev/null)
+          git -C "$cwd" merge-base --all HEAD "${bases[@]}" 2>/dev/null)
         if [ "${#mbs[@]}" -gt 0 ]; then
           diff_base="${mbs[0]}"
           if [ "${#mbs[@]}" -gt 1 ]; then
             mt=""
-            read -r mt < <(git -C "$cwd" --no-optional-locks merge-tree --write-tree "${mbs[0]}" "${mbs[1]}" 2>/dev/null)
+            read -r mt < <(git -C "$cwd" merge-tree --write-tree "${mbs[0]}" "${mbs[1]}" 2>/dev/null)
             [[ "$mt" =~ ^[0-9a-f]{40,64}$ ]] && diff_base="$mt"
           fi
         fi
       fi
       # --shortstat lets git do the summing (no awk fork); LC_ALL=C pins the English words we
       # parse. Binary files aren't counted, and a clean tree prints nothing at all.
-      stat_line=$(LC_ALL=C git -C "$cwd" --no-optional-locks diff --shortstat "$diff_base" 2>/dev/null)
+      stat_line=$(LC_ALL=C git -C "$cwd" diff --shortstat "$diff_base" 2>/dev/null)
       git_added=0; git_removed=0
       [[ "$stat_line" =~ ([0-9]+)\ insertion ]] && git_added="${BASH_REMATCH[1]}"
       [[ "$stat_line" =~ ([0-9]+)\ deletion ]] && git_removed="${BASH_REMATCH[1]}"
@@ -609,9 +617,8 @@ if [ -n "$cwd" ]; then
 fi
 
 # --- Installed Claude Code version (read from versioned symlink) ---
-# ~/.local/bin/claude is a symlink whose target ends in the version.
-# readlink is a single syscall (<1ms), cheaper than the stat+date math a cache would cost.
-# CLAUDE_SL_INSTALLED_VERSION pins it (used by the test suite).
+# ~/.local/bin/claude is a symlink whose target ends in the version. Checked every tick (no cache),
+# so an auto-update shows up right away. CLAUDE_SL_INSTALLED_VERSION pins it (used by the test suite).
 installed_version="${CLAUDE_SL_INSTALLED_VERSION-}"
 if [ -z "${CLAUDE_SL_INSTALLED_VERSION+set}" ] && [ -n "$cc_version" ]; then
   claude_bin=$(command -v claude 2>/dev/null)
@@ -734,13 +741,7 @@ if [ -n "$cwd" ]; then
     location="${location} ${C_THISTLE}↳ ${git_worktree}${C_RESET}"
   fi
 fi
-if [ -n "$git_branch" ]; then
-  if [ -n "$location" ]; then
-    location="${location} ${C_LAVENDER}⎇ ${git_branch}${C_RESET}"
-  else
-    location="${C_LAVENDER}⎇ ${git_branch}${C_RESET}"
-  fi
-fi
+[ -n "$git_branch" ] && location="${location:+$location }${C_LAVENDER}⎇ ${git_branch}${C_RESET}"
 if [ -n "$location" ]; then
   session_row+=("$location")
 fi
@@ -776,7 +777,8 @@ if [ -n "$seven_day_pct" ]; then
 fi
 
 # Session: the messaging name other sessions use to reach this one — reference info, just before
-# the version (which ends the row, as the least-needed item and the first a narrow terminal cuts).
+# any pending update (which ends the row, as the least-needed item and the first a narrow terminal
+# cuts).
 # Shown as @name, since it's an address. Falls back to #<first 8 chars of the session UUID> on
 # versions that don't write one — # marks an id you can't message.
 if [ -n "$messaging_name" ]; then
@@ -794,26 +796,26 @@ fi
 
 # --- Join and output ---
 # Each row is joined with " · "; rows are separated by a newline (Claude Code renders one status
-# row per line). No trailing newline — Claude Code would count it as an extra empty row.
+# row per line). Every row starts with a reset, which overrides Claude Code's ambient dim styling
+# (pattern from ccstatusline), and the output never ends in a bare newline.
 join_parts() {
   local out="$1"; shift
   local part
   for part in "$@"; do out="${out} ${C_FAINT}·${C_RESET} ${part}"; done
   _joined="$out"
 }
-line=""
+rows=()
 if (( ${#session_row[@]} > 0 )); then
   join_parts "${session_row[@]}"
-  line="$_joined"
+  rows+=("$_joined")
 fi
 # usage_row always holds at least the context and 5-hour segments
 join_parts "${usage_row[@]}"
-[ -n "$line" ] && line="${line}\033[0m\n\033[0m"
-line="${line}${_joined}"
+rows+=("$_joined")
 # A spacer row after row 2 separates the statusline from Claude Code's own footer below it (mode,
-# shells, agents, the PR link, workflow progress). It's a reset plus a space rather than a bare
-# trailing newline, which Claude Code may count or trim unpredictably. CLAUDE_SL_SPACER=0 turns it off.
-[ "${CLAUDE_SL_SPACER-1}" != "0" ] && line="${line}\033[0m\n\033[0m "
-# Leading reset overrides Claude Code's dim styling (pattern from ccstatusline); repeated at the
-# start of each row above so none is dimmed.
-printf '\033[0m%b\033[0m' "$line"
+# shells, agents, the PR link, workflow progress). It's a lone space rather than a bare trailing
+# newline, which Claude Code may count or trim unpredictably. CLAUDE_SL_SPACER=0 turns it off.
+[ "${CLAUDE_SL_SPACER-1}" != "0" ] && rows+=(" ")
+out=""
+for row in "${rows[@]}"; do out="${out:+$out$'\n'}${C_RESET}${row}${C_RESET}"; done
+printf '%s' "$out"
