@@ -13,14 +13,20 @@ input=$(cat)
 now_ts=$(date +%s)
 
 # --- ANSI colors ---
+# Green / yellow / red mean "how much is used" (plus git's +added/-removed), so a yellow gauge
+# never reads like the folder or model name. Row 1's location is a blue folder and lavender branch,
+# the model is Claude's terracotta, and the session's messaging name is a light sky blue (no green
+# in it, so it never reads like the +added count).
 C_GREEN="\033[32m"
 C_YELLOW="\033[33m"
 C_RED="\033[31m"
 C_GREY="\033[38;5;245m"
 C_LAVENDER="\033[38;5;147m"
 C_BLUE="\033[38;5;75m"
-C_SEAGREEN="\033[38;5;78m"
+C_SKY="\033[38;5;117m"
+C_ORANGE="\033[38;5;173m"
 C_DIM_WHITE="\033[38;5;250m"
+C_FAINT="\033[38;5;240m"     # structure, not content: the · separators and the bars' empty track
 C_RESET="\033[0m"
 
 # --- Progress bar helpers (set variables, no subshells) ---
@@ -28,15 +34,17 @@ C_RESET="\033[0m"
 build_bar() {
   local pct=${1:-0} total=${2:-10}
   local filled=$(( (pct * total + 50) / 100 ))
-  local bar=""
+  local fill="" track=""
   # 10 cells = 10% increments. Braille fill: ⣿ (all 8 dots, gap-free) for filled, ⣀ (low baseline
   # dots) for the empty track. Swap these two glyphs to restyle (e.g. █/░ solid, ⡇/⡀ thin).
-  for ((i=0; i<filled; i++));     do bar="${bar}⣿"; done
-  for ((i=filled; i<total; i++)); do bar="${bar}⣀"; done
+  for ((i=0; i<filled; i++));     do fill="${fill}⣿"; done
+  for ((i=filled; i<total; i++)); do track="${track}⣀"; done
   _pct_color="$C_GREEN"
   (( pct >= 50 )) && _pct_color="$C_YELLOW"
   (( pct >= 80 )) && _pct_color="$C_RED"
-  _bar_result="${_pct_color}${bar}${C_RESET}"
+  # Only the used part carries the threshold color; the empty track recedes into dark grey, so
+  # a 15% bar reads as a short green stub rather than ten cells of green.
+  _bar_result="${_pct_color}${fill}${C_FAINT}${track}${C_RESET}"
 }
 
 # Round a possibly-fractional percentage to an int in _pct_int, clamped to 0–100: the API can
@@ -86,7 +94,7 @@ eval "$(echo "$input" | jq -r '
   @sh "vim_mode=\(.vim.mode // "")",
   @sh "session_name=\(.session_name // "")",
   @sh "session_id=\(.session_id // "")",
-  @sh "effort=\((.effort | if type == "object" then .level // "" else . // "" end) // .effortLevel // .effort_level // "")",
+  @sh "effort=\((.effort | if type == "object" then .level else . end) // .effortLevel // .effort_level // "")",
   @sh "five_hour_pct=\(.rate_limits.five_hour.used_percentage // "")",
   @sh "five_hour_reset=\(.rate_limits.five_hour.resets_at // 0)",
   @sh "seven_day_pct=\(.rate_limits.seven_day.used_percentage // "")",
@@ -579,8 +587,9 @@ fi
 # --- Installed Claude Code version (read from versioned symlink) ---
 # ~/.local/bin/claude is a symlink whose target ends in the version.
 # readlink is a single syscall (<1ms), cheaper than the stat+date math a cache would cost.
-installed_version=""
-if [ -n "$cc_version" ]; then
+# CLAUDE_SL_INSTALLED_VERSION pins it (used by the test suite).
+installed_version="${CLAUDE_SL_INSTALLED_VERSION-}"
+if [ -z "${CLAUDE_SL_INSTALLED_VERSION+set}" ] && [ -n "$cc_version" ]; then
   claude_bin=$(command -v claude 2>/dev/null)
   if [ -n "$claude_bin" ] && [ -L "$claude_bin" ]; then
     target=$(readlink "$claude_bin" 2>/dev/null)
@@ -594,16 +603,50 @@ if [ -n "$installed_version" ] && [ -n "$cc_version" ] && [ "$installed_version"
   update_available="1"
 fi
 
-# --- Build parts ---
-parts=()
-
-# Session: only show if unnamed
-if [ -z "$session_name" ]; then
-  if [ -n "$session_id" ]; then
-    parts+=("${C_LAVENDER}[${session_id:0:8}]${C_RESET}")
-  else
-    parts+=("${C_LAVENDER}[none]${C_RESET}")
+# --- Session messaging name ---
+# Claude Code sessions message each other by a short name ("loretta-76", "<repo>-d4"), not by the
+# session UUID. The name isn't in the statusline payload; each running session records it in
+# <config>/sessions/<pid>.json next to its sessionId. The statusline is normally a child of that
+# claude process, so $PPID.json is tried first (one read, no fork); otherwise one grep finds the
+# file holding this session_id. Read every tick, so a /rename shows up immediately.
+# CLAUDE_SL_SESSIONS_DIR overrides the directory (used by the test suite).
+messaging_name=""
+if [ -n "$session_id" ]; then
+  sessions_dir="${CLAUDE_SL_SESSIONS_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions}"
+  sess_file="${sessions_dir}/${PPID}.json"
+  sess_json=""
+  [ -r "$sess_file" ] && sess_json=$(<"$sess_file")
+  if [[ "$sess_json" != *"\"$session_id\""* ]] && [ -d "$sessions_dir" ]; then
+    sess_file=$(grep -lF -- "\"$session_id\"" "$sessions_dir"/*.json 2>/dev/null)
+    sess_file="${sess_file%%$'\n'*}"
+    sess_json=""
+    [ -n "$sess_file" ] && sess_json=$(<"$sess_file")
   fi
+  if [[ "$sess_json" == *"\"$session_id\""* ]] \
+     && [[ "$sess_json" =~ \"name\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+    messaging_name="${BASH_REMATCH[1]}"
+  fi
+fi
+
+# --- Build rows ---
+# Two rows, each read left to right from what you check most to what you only need now and then:
+#   row 1 — what and where: model + effort · dir ↳ worktree ⎇ branch · lines changed
+#   row 2 — gauges, then reference: context · 5-hour · weekly · style · vim · messaging name · version
+# Row 2 always opens with the context gauge, so the bars sit in the same columns whatever the model
+# or path. A single long row got cut off by Claude Code in deep directories, and the script can't
+# learn the terminal width to adapt.
+session_row=()
+usage_row=()
+
+# Model, with the effort level beside it in grey ("◆ Opus 5.5 medium") — both describe what's running
+if [ -n "$model" ]; then
+  if [ -n "$effort" ]; then
+    session_row+=("${C_ORANGE}◆ ${model}${C_RESET} ${C_GREY}${effort}${C_RESET}")
+  else
+    session_row+=("${C_ORANGE}◆ ${model}${C_RESET}")
+  fi
+elif [ -n "$effort" ]; then
+  session_row+=("${C_GREY}${effort}${C_RESET}")
 fi
 
 # Location: directory + worktree label + git branch as ONE segment, joined by plain spaces
@@ -624,31 +667,28 @@ if [ -n "$cwd" ]; then
   # Worktrees live at <repo>/.claude/worktrees/<name>. Collapse that whole tail back to the
   # repo root, then tag on a "↳ <name>" label so the worktree is named without the long path.
   display_dir="${display_dir%%/.claude/worktrees/*}"
-  location="${C_YELLOW}${display_dir}${C_RESET}"
-  if [ -n "$git_worktree" ]; then
-    location="${location} ${C_SEAGREEN}↳ ${git_worktree}${C_RESET}"
+  location="${C_BLUE}${display_dir}${C_RESET}"
+  # Skip the label when it would just repeat the folder name (~/…/worktree02 ↳ worktree02); it
+  # stays when the folder shows something else, e.g. the repo root of a .claude/worktrees/ checkout.
+  if [ -n "$git_worktree" ] && [ "$git_worktree" != "${display_dir##*/}" ]; then
+    location="${location} ${C_GREY}↳ ${git_worktree}${C_RESET}"
   fi
 fi
 if [ -n "$git_branch" ]; then
   if [ -n "$location" ]; then
-    location="${location} ${C_BLUE}⎇ ${git_branch}${C_RESET}"
+    location="${location} ${C_LAVENDER}⎇ ${git_branch}${C_RESET}"
   else
-    location="${C_BLUE}⎇ ${git_branch}${C_RESET}"
+    location="${C_LAVENDER}⎇ ${git_branch}${C_RESET}"
   fi
 fi
 if [ -n "$location" ]; then
-  parts+=("$location")
+  session_row+=("$location")
 fi
 
 # Lines changed (real git diff vs the branch's fork point — committed + uncommitted).
 # Hidden on a clean tree so +0/-0 never adds noise.
 if [ "${git_added:-0}" != "0" ] || [ "${git_removed:-0}" != "0" ]; then
-  parts+=("${C_GREEN}+${git_added:-0}${C_RESET}/${C_RED}-${git_removed:-0}${C_RESET}")
-fi
-
-# Model
-if [ -n "$model" ]; then
-  parts+=("${C_YELLOW}◆ ${model}${C_RESET}")
+  session_row+=("${C_GREEN}+${git_added:-0}${C_RESET}/${C_RED}-${git_removed:-0}${C_RESET}")
 fi
 
 # Context bar
@@ -656,9 +696,9 @@ if [ -n "$ctx_pct" ]; then
   # Same clamp as the rate windows: a full context can report a hair over 100 ("101%").
   clamp_pct "$ctx_pct"
   build_bar "$_pct_int"
-  parts+=("${_pct_color}⛁ ${_pct_int}%${C_RESET} ${_bar_result}")
+  usage_row+=("${_pct_color}⛁ ${_pct_int}%${C_RESET} ${_bar_result}")
 else
-  parts+=("${C_GREY}⛁ --${C_RESET}")
+  usage_row+=("${C_GREY}⛁ --${C_RESET}")
 fi
 
 # Rate limit bars — 5-hour (⏱) session window and 7-day (⧖) weekly window.
@@ -666,43 +706,60 @@ fi
 # (the docs note either may be absent), so the weekly segment is simply skipped when missing.
 if [ -n "$five_hour_pct" ]; then
   build_rate_segment "$five_hour_pct" "$five_hour_reset" 18000 "⏱"
-  parts+=("$_rate_segment")
+  usage_row+=("$_rate_segment")
 else
-  parts+=("${C_GREY}⏱ --${C_RESET}")
+  usage_row+=("${C_GREY}⏱ --${C_RESET}")
 fi
 if [ -n "$seven_day_pct" ]; then
   build_rate_segment "$seven_day_pct" "$seven_day_reset" 604800 "⧖"
-  parts+=("$_rate_segment")
+  usage_row+=("$_rate_segment")
 fi
 
 # Output style (hidden when default)
 if [ -n "$output_style" ] && [ "$output_style" != "default" ]; then
-  parts+=("\033[35m☰${output_style}${C_RESET}")
-fi
-
-# Effort level
-if [ -n "$effort" ]; then
-  parts+=("${C_GREY}effort:${effort}${C_RESET}")
+  usage_row+=("\033[35m☰${output_style}${C_RESET}")
 fi
 
 # Vim mode
 if [ -n "$vim_mode" ]; then
-  parts+=("${C_GREY}vim:${vim_mode}${C_RESET}")
+  usage_row+=("${C_GREY}vim:${vim_mode}${C_RESET}")
 fi
 
-# Claude Code version (shown at the end; green ↻ when a newer version is installed)
-if [ -n "$cc_version" ]; then
-  update_marker=""
-  if [ -n "$update_available" ]; then
-    update_marker="${C_GREEN}↻${C_DIM_WHITE}"
-  fi
-  parts+=("${C_DIM_WHITE}v${cc_version}${update_marker}${C_RESET}")
+# Session: the messaging name other sessions use to reach this one — reference info, just before
+# the version (which ends the row, as the least-needed item and the first a narrow terminal cuts).
+# Shown as @name, since it's an address. Falls back to #<first 8 chars of the session UUID> on
+# versions that don't write one — # marks an id you can't message.
+if [ -n "$messaging_name" ]; then
+  usage_row+=("${C_SKY}@${messaging_name}${C_RESET}")
+elif [ -n "$session_id" ]; then
+  usage_row+=("${C_SKY}#${session_id:0:8}${C_RESET}")
+fi
+
+# Pending update: shown only when the installed Claude Code differs from the one running, as the
+# version a restart will bring ("v2.1.297 ↑"). The running version is hidden — it only matters
+# when it's out of date. ↑ rather than ↻, which already means "resets at" on this row.
+if [ -n "$update_available" ]; then
+  usage_row+=("${C_GREEN}v${installed_version} ↑${C_RESET}")
 fi
 
 # --- Join and output ---
-line="${parts[0]}"
-for part in "${parts[@]:1}"; do
-  line="${line} · ${part}"
-done
-# Leading reset overrides Claude Code's dim styling (pattern from ccstatusline)
+# Each row is joined with " · "; rows are separated by a newline (Claude Code renders one status
+# row per line). No trailing newline — Claude Code would count it as an extra empty row.
+join_parts() {
+  local out="$1"; shift
+  local part
+  for part in "$@"; do out="${out} ${C_FAINT}·${C_RESET} ${part}"; done
+  _joined="$out"
+}
+line=""
+if (( ${#session_row[@]} > 0 )); then
+  join_parts "${session_row[@]}"
+  line="$_joined"
+fi
+# usage_row always holds at least the context and 5-hour segments
+join_parts "${usage_row[@]}"
+[ -n "$line" ] && line="${line}\033[0m\n\033[0m"
+line="${line}${_joined}"
+# Leading reset overrides Claude Code's dim styling (pattern from ccstatusline); repeated at the
+# start of row 2 above so it isn't dimmed either.
 printf '\033[0m%b\033[0m' "$line"

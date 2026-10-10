@@ -19,10 +19,18 @@ export CLAUDE_SL_ACCOUNT
 # the fetch scenarios point CLAUDE_SL_USAGE_URL at a local fixture with a dummy token.
 CLAUDE_SL_USAGE_TTL=0
 export CLAUDE_SL_USAGE_TTL
+# Pin the "installed" Claude Code version so the update marker never depends on the developer's
+# real ~/.local/bin/claude symlink. Scenarios that send "version":"2.1.0" are up to date.
+CLAUDE_SL_INSTALLED_VERSION="2.1.0"
+export CLAUDE_SL_INSTALLED_VERSION
 RATE_CACHE="$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-a"
 USAGE_CACHE="$CLAUDE_SL_CACHE_DIR/claude-sl-usage-acct-a"
 RATE_CACHE_B="$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-b"
-trap 'rm -rf "$CLAUDE_SL_CACHE_DIR"' EXIT
+# Session messaging names are read from <config>/sessions/<pid>.json; point that at an empty dir
+# so the suite never picks up the developer's live sessions.
+CLAUDE_SL_SESSIONS_DIR=$(mktemp -d)
+export CLAUDE_SL_SESSIONS_DIR
+trap 'rm -rf "$CLAUDE_SL_CACHE_DIR" "$CLAUDE_SL_SESSIONS_DIR"' EXIT
 
 run_test() {
   local name="$1" json="$2"
@@ -42,13 +50,16 @@ run_test() {
     errors="${errors}\n    EXIT CODE: $exit_code (expected 0)"
   fi
 
-  # Test 2: exactly 1 line of output
+  # Test 2: at most 2 rows of output (location row + status row), no trailing newline
   local line_count
   line_count=$(printf '%s' "$stdout" | wc -l | tr -d ' ')
-  # wc -l counts newlines; a single line with no trailing newline = 0, with = 1
-  # printf '%s' strips trailing newline, so single line = 0
-  if [ "$line_count" -ne 0 ]; then
-    errors="${errors}\n    LINE COUNT: $((line_count + 1)) lines (expected 1)"
+  # wc -l counts newlines; $( ) strips a trailing one, so check the raw tail separately.
+  # Two rows with no trailing newline = 1.
+  if [ "$line_count" -gt 1 ]; then
+    errors="${errors}\n    LINE COUNT: $((line_count + 1)) rows (expected ≤ 2)"
+  fi
+  if [ "$(echo "$json" | bash "$SCRIPT" 2>/dev/null | tail -c 1 | od -An -c | tr -d ' ')" = '\n' ]; then
+    errors="${errors}\n    TRAILING NEWLINE: present"
   fi
 
   # Test 3: no stderr output (jq errors, etc.)
@@ -576,27 +587,32 @@ else
 fi
 rm -rf "$REPO_A" "$REPO_B"
 
-# --- Scenario 17i: Linked worktree labels the branch element (main checkout doesn't) ---
+# --- Scenario 17i: Linked worktree label — shown when the folder doesn't already name it ---
 WT_BASE=$(mktemp -d)
 WT_MAIN="$WT_BASE/repo"
 mkdir -p "$WT_MAIN"
 (git -C "$WT_MAIN" init -q -b main && git -C "$WT_MAIN" commit --allow-empty -q -m init) 2>/dev/null
 git -C "$WT_MAIN" worktree add -q "$WT_BASE/repo-wt" -b wt-branch >/dev/null 2>&1
+git -C "$WT_MAIN" worktree add -q "$WT_MAIN/.claude/worktrees/feat-wt" -b feat-branch >/dev/null 2>&1
 out_main=$(echo "{\"workspace\":{\"current_dir\":\"$WT_MAIN\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 out_wt=$(echo "{\"workspace\":{\"current_dir\":\"$WT_BASE/repo-wt\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+out_cwt=$(echo "{\"workspace\":{\"current_dir\":\"$WT_MAIN/.claude/worktrees/feat-wt\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 TOTAL=$((TOTAL + 1))
-# Icon-agnostic: in the worktree the location segment carries BOTH the worktree name (as the
-# directory tail and again as the "↳ <name>" label → repo-wt appears twice) and the branch
-# ("wt-branch"); the main checkout has no worktree label so "repo-wt" never appears there.
+# Icon-agnostic. A sibling worktree's folder already ends in its name, so "repo-wt" appears once
+# (no repeated "↳ repo-wt" label) next to its branch. A .claude/worktrees/ checkout collapses to
+# the repo root, so it keeps the "↳ feat-wt" label. The main checkout never mentions "repo-wt".
 wt_label_count=$(echo "$out_wt" | grep -oF 'repo-wt' | wc -l | tr -d ' ')
-if [ "$wt_label_count" -ge 2 ] && echo "$out_wt" | grep -qF 'wt-branch' && ! echo "$out_main" | grep -qF 'repo-wt'; then
+if [ "$wt_label_count" -eq 1 ] && echo "$out_wt" | grep -qF 'wt-branch' \
+   && echo "$out_cwt" | grep -qF '↳ feat-wt' && echo "$out_cwt" | grep -qF 'feat-branch' \
+   && ! echo "$out_main" | grep -qF 'repo-wt'; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Linked worktree labels the branch element\n"
+  printf "  \033[32m✓\033[0m Worktree label shown only when the folder doesn't already name it\n"
 else
   FAIL=$((FAIL + 1))
-  printf "  \033[31m✗\033[0m Worktree label wrong — wt:%s main:%s\n" "$out_wt" "$out_main"
+  printf "  \033[31m✗\033[0m Worktree label wrong — wt:%s cwt:%s main:%s\n" "$out_wt" "$out_cwt" "$out_main"
 fi
 git -C "$WT_MAIN" worktree remove --force "$WT_BASE/repo-wt" 2>/dev/null
+git -C "$WT_MAIN" worktree remove --force "$WT_MAIN/.claude/worktrees/feat-wt" 2>/dev/null
 rm -rf "$WT_BASE"
 
 # --- Scenario 17i2: Worktree label uses the checkout dir name, not git's internal id ---
@@ -900,6 +916,59 @@ else
   printf "  \033[31m✗\033[0m Weekly should be skipped when absent — output: %s\n" "$out"
 fi
 
+# --- Scenario 16b: Two-row layout — model + location on top, gauges + reference below ---
+TOTAL=$((TOTAL + 1))
+out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"session_id":"abc12345-xxxx","effort":"medium","output_style":"Learning","context_window":{"used_percentage":10},"rate_limits":{"five_hour":{"used_percentage":15}},"version":"2.1.0"}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+row1=$(printf '%s\n' "$out" | sed -n 1p)
+row2=$(printf '%s\n' "$out" | sed -n 2p)
+if [ "$row1" = "◆ Opus 5.5 medium · /tmp" ] \
+   && [[ "$row2" == "⛁ 10% "*" · ⏱ 15% "*" · ☰Learning · #abc12345" ]] \
+   && [[ "$out" != *"effort:"* ]]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Row 1: model + effort · dir; row 2: gauges · style · session (version hidden when current)\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Two-row layout wrong — output: %s\n" "$out"
+fi
+
+# --- Scenario 16b2: Pending update shows the version a restart brings, not the running one ---
+TOTAL=$((TOTAL + 1))
+out=$(echo '{"model":{"display_name":"x"},"version":"2.1.0"}' | CLAUDE_SL_INSTALLED_VERSION="2.1.5" bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+if [[ "$out" == *" · v2.1.5 ↑" ]] && [[ "$out" != *"2.1.0"* ]]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Update pending: shows v2.1.5 ↑, hides the running 2.1.0\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Update marker wrong — output: %s\n" "$out"
+fi
+
+# --- Scenario 16c: Messaging name from the session registry replaces the UUID prefix ---
+# Claude Code writes <config>/sessions/<pid>.json with the sessionId and the name other sessions
+# use to message this one. A named session must show it too (it used to hide the id entirely).
+TOTAL=$((TOTAL + 1))
+printf '{\n  "pid": 4242,\n  "sessionId": "abc12345-def6",\n  "name": "repo-d4",\n  "nameSource": "derived"\n}\n' > "$CLAUDE_SL_SESSIONS_DIR/4242.json"
+out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"x"},"session_id":"abc12345-def6","session_name":"renamed"}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+other=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"x"},"session_id":"ffff0000-1111"}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+rm -f "$CLAUDE_SL_SESSIONS_DIR/4242.json"
+if [[ "$out" == *" · @repo-d4" ]] && [[ "$other" == *" · #ffff0000" ]]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Messaging name shown (@repo-d4); unregistered session falls back to #id\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Messaging name lookup — output: %s / %s\n" "$out" "$other"
+fi
+
+# --- Scenario 16d: Full directory names are kept (only $HOME collapses to ~) ---
+TOTAL=$((TOTAL + 1))
+out=$(echo "{\"workspace\":{\"current_dir\":\"$HOME/Projects/Github/my-repo\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+if [[ "$out" == "◆ x · ~/Projects/Github/my-repo"* ]]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Path shown in full: ~/Projects/Github/my-repo\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Path should be shown in full — output: %s\n" "$out"
+fi
+
 # --- Scenario 17: Rapid redraw (consistency) ---
 echo ""
 echo "  Rapid redraw test (20 iterations)..."
@@ -908,7 +977,7 @@ redraw_fail_iter=0
 for i in $(seq 1 20); do
   out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 4.6"},"context_window":{"used_percentage":42},"rate_limits":{"five_hour":{"used_percentage":15}},"output_style":"Learning","session_name":"test"}' | bash "$SCRIPT" 2>/dev/null)
   lc=$(printf '%s' "$out" | wc -l | tr -d ' ')
-  if [ "$lc" -ne 0 ]; then
+  if [ "$lc" -ne 1 ]; then
     redraw_pass=false
     redraw_fail_iter=$i
     break
@@ -917,10 +986,10 @@ done
 TOTAL=$((TOTAL + 1))
 if $redraw_pass; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Rapid redraw (20x) — all single-line\n"
+  printf "  \033[32m✓\033[0m Rapid redraw (20x) — always two rows\n"
 else
   FAIL=$((FAIL + 1))
-  printf "  \033[31m✗\033[0m Rapid redraw — multi-line at iteration %d\n" "$redraw_fail_iter"
+  printf "  \033[31m✗\033[0m Rapid redraw — wrong row count at iteration %d\n" "$redraw_fail_iter"
 fi
 
 # --- Scenario 18: Performance ---
