@@ -21,8 +21,8 @@ file_mtime() { stat -f%m "$1" 2>/dev/null || stat -c%Y "$1" 2>/dev/null; }
 
 # --- ANSI colors ---
 # Green / yellow / red mean "how much is used" (plus git's +added/-removed), so a yellow gauge
-# never reads like the folder or model name. Row 1's location is a sky-blue folder and lavender
-# branch, the model is Claude's terracotta, and the session's messaging name is link blue — it's
+# never reads like the folder or model name. Row 1's location is a sky-blue folder, thistle-pink
+# worktree and lavender branch, the model is Claude's terracotta, and the session's messaging name is link blue — it's
 # the address other sessions use (no green in either blue, so neither reads like the +added count).
 C_GREEN="\033[32m"
 C_YELLOW="\033[33m"
@@ -32,6 +32,7 @@ C_LAVENDER="\033[38;5;147m"
 C_BLUE="\033[38;5;75m"
 C_SKY="\033[38;5;117m"
 C_ORANGE="\033[38;5;173m"
+C_THISTLE="\033[38;5;182m"
 C_FAINT="\033[38;5;240m"     # structure, not content: the · separators and the bars' empty track
 C_RESET="\033[0m"
 
@@ -686,19 +687,22 @@ fi
 
 # --- Build rows ---
 # Two rows, each read left to right from what you check most to what you only need now and then:
-#   row 1 — what and where: model + effort · dir ↳ worktree ⎇ branch · lines changed
-#   row 2 — gauges, then reference: context · 5-hour · weekly · style · messaging name · pending update
+#   row 1 — what and where: model + effort/fast/style · dir ↳ worktree ⎇ branch · lines changed
+#   row 2 — gauges, then reference: context · 5-hour · weekly · messaging name · pending update
 # Row 2 always opens with the context gauge, so the bars sit in the same columns whatever the model
 # or path. A single long row got cut off by Claude Code in deep directories, and the script can't
 # learn the terminal width to adapt.
 session_row=()
 usage_row=()
 
-# Model, with the effort level and fast mode beside it in grey ("◆ Opus 5.5 medium fast") — all
-# three describe what's running
+# Model, with effort, fast mode and a non-default output style beside it in grey
+# ("◆ Opus 5.5 medium fast ☰Learning") — all describe how Claude is running
 model_mods=""
 [ -n "$effort" ] && model_mods="$effort"
 [ -n "$fast_mode" ] && model_mods="${model_mods:+$model_mods }fast"
+if [ -n "$output_style" ] && [ "$output_style" != "default" ]; then
+  model_mods="${model_mods:+$model_mods }☰${output_style}"
+fi
 if [ -n "$model" ]; then
   session_row+=("${C_ORANGE}◆ ${model}${C_RESET}${model_mods:+ ${C_GREY}${model_mods}${C_RESET}}")
 elif [ -n "$model_mods" ]; then
@@ -727,7 +731,7 @@ if [ -n "$cwd" ]; then
   # Skip the label when it would just repeat the folder name (~/…/worktree02 ↳ worktree02); it
   # stays when the folder shows something else, e.g. the repo root of a .claude/worktrees/ checkout.
   if [ -n "$git_worktree" ] && [ "$git_worktree" != "${display_dir##*/}" ]; then
-    location="${location} ${C_GREY}↳ ${git_worktree}${C_RESET}"
+    location="${location} ${C_THISTLE}↳ ${git_worktree}${C_RESET}"
   fi
 fi
 if [ -n "$git_branch" ]; then
@@ -769,11 +773,6 @@ fi
 if [ -n "$seven_day_pct" ]; then
   build_rate_segment "$seven_day_pct" "$seven_day_reset" 604800 "⧖"
   usage_row+=("$_rate_segment")
-fi
-
-# Output style (hidden when default)
-if [ -n "$output_style" ] && [ "$output_style" != "default" ]; then
-  usage_row+=("\033[35m☰${output_style}${C_RESET}")
 fi
 
 # Session: the messaging name other sessions use to reach this one — reference info, just before

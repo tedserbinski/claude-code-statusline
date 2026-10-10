@@ -921,11 +921,11 @@ TOTAL=$((TOTAL + 1))
 out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"session_id":"abc12345-xxxx","effort":"medium","output_style":"Learning","context_window":{"used_percentage":10},"rate_limits":{"five_hour":{"used_percentage":15}},"version":"2.1.0"}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 row1=$(printf '%s\n' "$out" | sed -n 1p)
 row2=$(printf '%s\n' "$out" | sed -n 2p)
-if [ "$row1" = "◆ Opus 5.5 medium · /tmp" ] \
-   && [[ "$row2" == "⛁ 10% "*" · ⏱ 15% "*" · ☰Learning · #abc12345" ]] \
+if [ "$row1" = "◆ Opus 5.5 medium ☰Learning · /tmp" ] \
+   && [[ "$row2" == "⛁ 10% "*" · ⏱ 15% "*" · #abc12345" ]] \
    && [[ "$out" != *"effort:"* ]]; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Row 1: model + effort · dir; row 2: gauges · style · session (version hidden when current)\n"
+  printf "  \033[32m✓\033[0m Row 1: model + effort + style · dir; row 2: gauges · session (version hidden when current)\n"
 else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Two-row layout wrong — output: %s\n" "$out"
