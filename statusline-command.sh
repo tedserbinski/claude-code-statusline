@@ -21,9 +21,9 @@ file_mtime() { stat -f%m "$1" 2>/dev/null || stat -c%Y "$1" 2>/dev/null; }
 
 # --- ANSI colors ---
 # Green / yellow / red mean "how much is used" (plus git's +added/-removed), so a yellow gauge
-# never reads like the folder or model name. Row 1's location is a blue folder and lavender branch,
-# the model is Claude's terracotta, and the session's messaging name is a light sky blue (no green
-# in it, so it never reads like the +added count).
+# never reads like the folder or model name. Row 1's location is a sky-blue folder and lavender
+# branch, the model is Claude's terracotta, and the session's messaging name is link blue — it's
+# the address other sessions use (no green in either blue, so neither reads like the +added count).
 C_GREEN="\033[32m"
 C_YELLOW="\033[33m"
 C_RED="\033[31m"
@@ -726,7 +726,7 @@ if [ -n "$cwd" ]; then
   # Worktrees live at <repo>/.claude/worktrees/<name>. Collapse that whole tail back to the
   # repo root, then tag on a "↳ <name>" label so the worktree is named without the long path.
   display_dir="${display_dir%%/.claude/worktrees/*}"
-  location="${C_BLUE}${display_dir}${C_RESET}"
+  location="${C_SKY}${display_dir}${C_RESET}"
   # Skip the label when it would just repeat the folder name (~/…/worktree02 ↳ worktree02); it
   # stays when the folder shows something else, e.g. the repo root of a .claude/worktrees/ checkout.
   if [ -n "$git_worktree" ] && [ "$git_worktree" != "${display_dir##*/}" ]; then
@@ -801,9 +801,9 @@ fi
 # Shown as @name, since it's an address. Falls back to #<first 8 chars of the session UUID> on
 # versions that don't write one — # marks an id you can't message.
 if [ -n "$messaging_name" ]; then
-  usage_row+=("${C_SKY}@${messaging_name}${C_RESET}")
+  usage_row+=("${C_BLUE}@${messaging_name}${C_RESET}")
 elif [ -n "$session_id" ]; then
-  usage_row+=("${C_SKY}#${session_id:0:8}${C_RESET}")
+  usage_row+=("${C_BLUE}#${session_id:0:8}${C_RESET}")
 fi
 
 # Pending update: shown only when the installed Claude Code differs from the one running, as the

@@ -37,7 +37,7 @@ The top row holds the model through lines changed; the bottom row holds context 
 | **Model** | `◆ Opus 4.7 1M` | orange | Starts the top row. `Claude ` prefix stripped; `(1M context)` / `(200K context)` collapsed to a bare size token. |
 | **Effort level** | `high` | grey | Right after the model name (`◆ Opus 4.7 1M high`), only when an effort level is set. |
 | **Fast mode** | `fast` | grey | After the effort level, only while fast mode is on. |
-| **Directory** | `~/Documents/projects` | blue | Home directory is abbreviated to `~`. A `<repo>/.claude/worktrees/<name>` tail collapses back to the repo root, so a worktree shows its repo path plus the `↳` label rather than a long nested path. |
+| **Directory** | `~/Documents/projects` | sky blue | Home directory is abbreviated to `~`. A `<repo>/.claude/worktrees/<name>` tail collapses back to the repo root, so a worktree shows its repo path plus the `↳` label rather than a long nested path. |
 | **Worktree** | `↳ wt-name` | grey | Shown between the directory and the branch (`~/repo ↳ wt-name ⎇ feat`) only when inside a *linked* git worktree, and only when the directory doesn't already end in that name. The name is the worktree's **checkout directory** name, not git's internal worktree id — that id is a sanitized, de-duplicated basename that can degrade to `0` or `-` on collision. |
 | **Git branch** | `⎇ main` | lavender | Only when inside a git repo. Falls back to short commit SHA if HEAD is detached. |
 | **Pull request** | `#123 approved` | lavender + grey | Only when Claude Code reports an open PR for the branch (payload `pr`). The review state is lowercased GitHub wording and omitted when there isn't one. |
@@ -48,7 +48,7 @@ The top row holds the model through lines changed; the bottom row holds context 
 | **Reset time** | `↻8:10pm` / `↻Jun 1` | grey | When the rate window resets, read from `resets_at`. Shows the clock time if it resets later today, otherwise the month + day. Hidden if the reset is further out than the window itself. If the reset has already *passed*, the window rolled over — the segment shows `0%` with no `↻` (the new window's anchor is unknown until the next API response). |
 | **Output style** | `☰Explanatory` | magenta | Hidden when the style is `default`. Shows when you're in Learning, Explanatory, or a custom style. |
 | **Vim mode** | `vim:NORMAL` | grey | Only when vim mode is active. |
-| **Messaging name** | `@loretta-76` | light sky blue | The name other sessions message this one by, from `~/.claude/sessions/<pid>.json`. Falls back to `#abc12345` (first 8 chars of the session UUID) when no name is recorded. |
+| **Messaging name** | `@loretta-76` | blue | The name other sessions message this one by, from `~/.claude/sessions/<pid>.json`. Falls back to `#abc12345` (first 8 chars of the session UUID) when no name is recorded. |
 | **Pending update** | `v2.1.297 ↑` | green | Only when the installed Claude Code differs from the running one; shows the installed version, which a restart switches to. Hidden otherwise. |
 
 ### Progress bar thresholds
