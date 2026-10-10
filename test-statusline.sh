@@ -969,6 +969,69 @@ else
   printf "  \033[31m✗\033[0m Path should be shown in full — output: %s\n" "$out"
 fi
 
+# --- Scenario 16e: Fast mode joins effort beside the model; the PR and its review state follow the branch ---
+TOTAL=$((TOTAL + 1))
+out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"effort":{"level":"high"},"fast_mode":true,"pr":{"number":42,"url":"https://x/42","review_state":"CHANGES_REQUESTED"}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+plain=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"fast_mode":false,"pr":{"number":7}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+if [[ "$out" == "◆ Opus 5.5 high fast · /tmp #42 changes requested"* ]] && [[ "$plain" == "◆ Opus 5.5 · /tmp #7"$'\n'* ]]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Fast mode beside effort; PR #42 + review state after the location\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Fast/PR rendering — output: %s / %s\n" "$out" "$plain"
+fi
+
+# --- Scenario 16f: An idle tick replaying the same numbers doesn't rewrite the shared snapshot ---
+TOTAL=$((TOTAL + 1))
+rm -f "$RATE_CACHE" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+idle_json="{\"model\":{\"display_name\":\"x\"},\"session_id\":\"sess-idle-w\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":20,\"resets_at\":$(( $(date +%s) + 3600 ))}}}"
+echo "$idle_json" | bash "$SCRIPT" >/dev/null 2>&1
+touch -t 200001010000 "$RATE_CACHE"
+echo "$idle_json" | bash "$SCRIPT" >/dev/null 2>&1
+touch -t 200001010001 "$TMPFILE.ref"
+if [ -f "$RATE_CACHE" ] && [ "$TMPFILE.ref" -nt "$RATE_CACHE" ]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Unchanged rate snapshot is not rewritten on an idle tick\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Idle tick rewrote the shared rate snapshot\n"
+fi
+rm -f "$TMPFILE.ref"
+
+# --- Scenario 16g: Account cache from an older version (bare account, no check time) is refreshed ---
+TOTAL=$((TOTAL + 1))
+acct_dir=$(mktemp -d)
+printf '{"oauthAccount":{"accountUuid":"acct-new"}}' > "$acct_dir/.claude.json"
+printf 'acct-old' > "$CLAUDE_SL_CACHE_DIR/claude-sl-account"
+echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":33,\"resets_at\":$(( $(date +%s) + 3600 ))}}}" \
+  | env -u CLAUDE_SL_ACCOUNT CLAUDE_CONFIG_DIR="$acct_dir" bash "$SCRIPT" >/dev/null 2>&1
+acct_line=$(tr '\037' ' ' < "$CLAUDE_SL_CACHE_DIR/claude-sl-account")
+if [[ "$acct_line" =~ ^[0-9]+\ acct-new$ ]] && [ -f "$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-new" ]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Legacy account cache refreshed into <checked_at><sep><account>\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Account cache not refreshed — got: %s\n" "$acct_line"
+fi
+rm -rf "$acct_dir" "$CLAUDE_SL_CACHE_DIR/claude-sl-account" "$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-new" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+
+# --- Scenario 16h: Daily prune drops our files untouched for 7+ days, keeps fresh ones ---
+TOTAL=$((TOTAL + 1))
+prune_dir=$(mktemp -d)
+touch -t 202001010000 "$prune_dir/claude-sl-seen-dead" "$prune_dir/.claude-sl-rate.999" "$prune_dir/unrelated-file"
+touch "$prune_dir/claude-sl-seen-live"
+echo '{"model":{"display_name":"x"}}' | CLAUDE_SL_CACHE_DIR="$prune_dir" bash "$SCRIPT" >/dev/null 2>&1
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -e "$prune_dir/claude-sl-seen-dead" ] || break; sleep 0.1; done
+if ! [ -e "$prune_dir/claude-sl-seen-dead" ] && ! [ -e "$prune_dir/.claude-sl-rate.999" ] \
+   && [ -e "$prune_dir/claude-sl-seen-live" ] && [ -e "$prune_dir/unrelated-file" ]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Daily prune removes stale claude-sl files only\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Prune wrong — left: %s\n" "$(ls -1a "$prune_dir" | tr '\n' ' ')"
+fi
+rm -rf "$prune_dir"
+
 # --- Scenario 17: Rapid redraw (consistency) ---
 echo ""
 echo "  Rapid redraw test (20 iterations)..."

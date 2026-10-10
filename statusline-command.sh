@@ -6,11 +6,18 @@
 # positive for every one of them. Suppress it file-wide rather than at each use site.
 # shellcheck disable=SC2154
 
-input=$(cat)
+# Builtin read instead of $(cat): one fewer process per tick. read returns non-zero at EOF,
+# which is expected here.
+IFS= read -r -d '' input || true
 
 # One timestamp per render — every freshness/expiry check below compares against this instead
-# of spawning its own `date` subprocess.
-now_ts=$(date +%s)
+# of spawning its own `date` subprocess. $EPOCHSECONDS is bash 5's builtin clock; bash 3.2 (stock
+# macOS) falls back to date.
+if [ -n "${EPOCHSECONDS-}" ]; then now_ts=$EPOCHSECONDS; else now_ts=$(date +%s); fi
+
+# File modification time in epoch seconds: BSD/macOS stat first, then GNU/Linux. Only used off the
+# hot path (stale-lock checks); per-tick freshness is kept inside the cache files themselves.
+file_mtime() { stat -f%m "$1" 2>/dev/null || stat -c%Y "$1" 2>/dev/null; }
 
 # --- ANSI colors ---
 # Green / yellow / red mean "how much is used" (plus git's +added/-removed), so a yellow gauge
@@ -75,7 +82,14 @@ build_rate_segment() {
       # Within 24h → clock time (%l:%M%p), even across midnight; further out → month/day (%b %e).
       # The choice is by time-to-reset, NOT calendar date — a 5h window resetting at 1am tomorrow
       # should read "1:10am", not "May 27". Both formats produced in one `date` call.
-      local fmt; fmt=$(date -r "$reset_ts" '+%l:%M%p|%b %e')
+      # bash 4.2+ formats the time itself (printf %(…)T — no fork, and portable: GNU date's -r
+      # means "a file's mtime", not "this epoch"). Stock macOS bash 3.2 falls back to BSD date -r.
+      local fmt
+      if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2) )); then
+        printf -v fmt '%(%l:%M%p|%b %e)T' "$reset_ts"
+      else
+        fmt=$(date -r "$reset_ts" '+%l:%M%p|%b %e')
+      fi
       local r
       if (( reset_ts - now_ts <= 86400 )); then r="${fmt%%|*}"; else r="${fmt#*|}"; fi
       r="${r//  / }"; r="${r# }"; r="${r//AM/am}"; r="${r//PM/pm}"   # "  8:10PM" → "8:10pm"
@@ -99,7 +113,10 @@ eval "$(echo "$input" | jq -r '
   @sh "five_hour_reset=\(.rate_limits.five_hour.resets_at // 0)",
   @sh "seven_day_pct=\(.rate_limits.seven_day.used_percentage // "")",
   @sh "seven_day_reset=\(.rate_limits.seven_day.resets_at // 0)",
-  @sh "cc_version=\(.version // "")"
+  @sh "cc_version=\(.version // "")",
+  @sh "fast_mode=\(if .fast_mode == true then "1" else "" end)",
+  @sh "pr_number=\(.pr.number // "")",
+  @sh "pr_review=\(.pr.review_state // "")"
 ')"
 model="${model#Claude }"
 # Compact any "(1M context)" / "(200K context)" annotation to just the size token, so every
@@ -119,15 +136,26 @@ fi
 # CLAUDE_SL_ACCOUNT pins the id explicitly (used by the test suite). An unknown account — logged
 # out, or API-key auth, which has no subscription rate limits at all — falls back to the
 # unsuffixed snapshot, which is also what installs that predate this keying already use.
-cache_dir="${CLAUDE_SL_CACHE_DIR:-${TMPDIR:-/tmp}}"
+# macOS's $TMPDIR is already per-user; on Linux it's usually unset and /tmp is shared by every
+# user, so the caches get a private per-uid directory there (created once, mode 700).
+if [ -n "${CLAUDE_SL_CACHE_DIR-}" ]; then
+  cache_dir="$CLAUDE_SL_CACHE_DIR"
+elif [ -n "${TMPDIR-}" ]; then
+  cache_dir="${TMPDIR%/}"
+else
+  cache_dir="/tmp/claude-sl-${UID:-$(id -u)}"
+  [ -d "$cache_dir" ] || mkdir -m 700 "$cache_dir" 2>/dev/null || cache_dir="/tmp"
+fi
 account="${CLAUDE_SL_ACCOUNT-}"
 if [ -z "${CLAUDE_SL_ACCOUNT+set}" ]; then
+  # Record format: "<checked_at>\037<account>". The check time lives in the file so its age costs a
+  # builtin read rather than a stat fork. A file from an older version (bare account) reads as
+  # never checked and is refreshed.
   acct_cache="${cache_dir}/claude-sl-account"
-  acct_age=999999999
-  if [ -f "$acct_cache" ]; then
-    acct_age=$(( now_ts - $(stat -f%m "$acct_cache" 2>/dev/null || echo 0) ))
-  fi
-  if [ "$acct_age" -ge 5 ]; then
+  acct_at="" cached_account=""
+  [ -f "$acct_cache" ] && IFS=$'\037' read -r acct_at cached_account < "$acct_cache" 2>/dev/null
+  [[ "$acct_at" =~ ^[0-9]+$ ]] || acct_at=0
+  if (( now_ts - acct_at >= 5 )); then
     cc_config="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
     if [ -r "$cc_config" ]; then
       # Indexing a missing/null .oauthAccount yields null in jq, so this stays quiet when logged out.
@@ -135,13 +163,12 @@ if [ -z "${CLAUDE_SL_ACCOUNT+set}" ]; then
     fi
     # Reduce to a safe filename component — the uuid already is one, an email address isn't.
     account="${account//[^A-Za-z0-9._-]/_}"
-    # Temp files are dot-prefixed so they can never be globbed as an account snapshot below.
-    tmp_acct=$(mktemp "${cache_dir}/.claude-sl-account.XXXXXX" 2>/dev/null)
-    if [ -n "$tmp_acct" ]; then
-      printf '%s' "$account" > "$tmp_acct" && mv "$tmp_acct" "$acct_cache"
-    fi
+    # Temp files are dot-prefixed so they can never be globbed as an account snapshot below, and
+    # named by PID ($$) so concurrent sessions never share one — no mktemp fork needed.
+    tmp_acct="${cache_dir}/.claude-sl-account.$$"
+    printf '%s\037%s' "$now_ts" "$account" > "$tmp_acct" 2>/dev/null && mv "$tmp_acct" "$acct_cache"
   else
-    IFS= read -r account < "$acct_cache" 2>/dev/null
+    account="$cached_account"
   fi
 fi
 # --- Rate-limit sync across sessions (login/logout, concurrent sessions, limit changes) ---
@@ -195,11 +222,9 @@ if [ -n "$seen_record" ] && { [ -n "$five_hour_pct" ] || [ -n "$seven_day_pct" ]
     fi
   else
     # Temp files are dot-prefixed so they can never be globbed as an account snapshot below.
-    tmp_seen=$(mktemp "${cache_dir}/.claude-sl-seen.XXXXXX" 2>/dev/null)
-    if [ -n "$tmp_seen" ]; then
-      printf '%s\037%s\037%s\037%s\037%s\037%s' "$account" "$five_hour_pct" "$five_hour_reset" \
-        "$seven_day_pct" "$seven_day_reset" "$now_ts" > "$tmp_seen" && mv "$tmp_seen" "$seen_record"
-    fi
+    tmp_seen="${cache_dir}/.claude-sl-seen.$$"
+    printf '%s\037%s\037%s\037%s\037%s\037%s' "$account" "$five_hour_pct" "$five_hour_reset" \
+      "$seven_day_pct" "$seven_day_reset" "$now_ts" > "$tmp_seen" 2>/dev/null && mv "$tmp_seen" "$seen_record"
   fi
 fi
 
@@ -265,13 +290,16 @@ pick_window "$seven_day_pct" "$seven_day_reset" "$observed_at" "$cached_7pct" "$
 seven_day_pct="$_w_pct"; seven_day_reset="$_w_reset"; seven_day_at="$_w_seen"
 # Publish the merged snapshot only when this payload actually carried rate data — a data-less
 # tick (new session pre-first-response, or a dropped carry-over) must never rewrite the shared
-# file it just read from. Atomic mktemp+mv, same pattern as the git cache below.
-if [ -n "$payload_had_rate" ]; then
-  tmp_rate=$(mktemp "${cache_dir}/.claude-sl-rate.XXXXXX" 2>/dev/null)
-  if [ -n "$tmp_rate" ]; then
-    printf '%s\037%s\037%s\037%s\037%s\037%s' "$five_hour_pct" "$five_hour_reset" "$seven_day_pct" "$seven_day_reset" \
-      "$five_hour_at" "$seven_day_at" > "$tmp_rate" && mv "$tmp_rate" "$rate_cache"
-  fi
+# file it just read from — and only when the merged result differs from what's already there (an
+# idle tick replays the same numbers; rewriting them would cost a write + mv fork every tick).
+# Atomic temp+mv, same pattern as the git cache below.
+rate_line="${five_hour_pct}"$'\037'"${five_hour_reset}"$'\037'"${seven_day_pct}"$'\037'"${seven_day_reset}"$'\037'"${five_hour_at}"$'\037'"${seven_day_at}"
+cached_line="${cached_5pct}"$'\037'"${cached_5rst}"$'\037'"${cached_7pct}"$'\037'"${cached_7rst}"$'\037'"${cached_5at}"$'\037'"${cached_7at}"
+rate_changed=""
+[ "$rate_line" != "$cached_line" ] && rate_changed=1
+if [ -n "$payload_had_rate" ] && [ -n "$rate_changed" ]; then
+  tmp_rate="${cache_dir}/.claude-sl-rate.$$"
+  printf '%s' "$rate_line" > "$tmp_rate" 2>/dev/null && mv "$tmp_rate" "$rate_cache"
 fi
 
 # --- Authoritative usage from Anthropic's OAuth usage endpoint (what the /usage view shows) ---
@@ -331,7 +359,8 @@ fetch_usage_in_background() {
   # mkdir is atomic: the first session to get it fetches, the rest skip. A lock older than a
   # minute belongs to a fetch that died (killed mid-flight, machine slept) and is reclaimed.
   if ! mkdir "$lock" 2>/dev/null; then
-    local lock_age=$(( now_ts - $(stat -f%m "$lock" 2>/dev/null || echo "$now_ts") ))
+    local lock_mtime; lock_mtime=$(file_mtime "$lock"); [[ "$lock_mtime" =~ ^[0-9]+$ ]] || lock_mtime=$now_ts
+    local lock_age=$(( now_ts - lock_mtime ))
     (( lock_age >= 60 )) || return 0
     rm -rf "$lock" 2>/dev/null; mkdir "$lock" 2>/dev/null || return 0
   fi
@@ -360,10 +389,10 @@ fetch_usage_in_background() {
       [ (.five_hour.utilization // ""), (.five_hour.resets_at | epoch),
         (.seven_day.utilization // ""), (.seven_day.resets_at | epoch) ]
       | map(tostring) | join("\u001f")' 2>/dev/null)
-    local fetched_at; fetched_at=$(date +%s)
+    local fetched_at; fetched_at=${EPOCHSECONDS:-$(date +%s)}
     if { [ "$code" = "200" ] || [ "$code" = "000" ]; } && [[ "$parsed" =~ ^[0-9] ]]; then
-      local tmp; tmp=$(mktemp "${cache_dir}/.claude-sl-usage.XXXXXX" 2>/dev/null) || exit 0
-      printf '%s\037%s' "$parsed" "$fetched_at" > "$tmp" && mv "$tmp" "$usage_file"
+      local tmp="${cache_dir}/.claude-sl-usage.$$"
+      printf '%s\037%s' "$parsed" "$fetched_at" > "$tmp" 2>/dev/null && mv "$tmp" "$usage_file"
       rm -f "${usage_file}.err"
     else
       printf '%s\037%s' "${code:-000}" "$fetched_at" > "${usage_file}.err" 2>/dev/null
@@ -414,7 +443,7 @@ git_worktree=""
 git_added=""
 git_removed=""
 if [ -n "$cwd" ]; then
-  cache_file="${TMPDIR:-/tmp}/claude-sl-git${cwd//\//_}"
+  cache_file="${cache_dir}/claude-sl-git${cwd//\//_}"
   c_gitdir=""; c_head=""; c_at=""
   if [ -f "$cache_file" ]; then
     IFS=$'\037' read -r git_branch git_worktree git_added git_removed c_gitdir c_head c_at < "$cache_file" 2>/dev/null
@@ -575,12 +604,10 @@ if [ -n "$cwd" ]; then
       [[ "$stat_line" =~ ([0-9]+)\ insertion ]] && git_added="${BASH_REMATCH[1]}"
       [[ "$stat_line" =~ ([0-9]+)\ deletion ]] && git_removed="${BASH_REMATCH[1]}"
     fi
-    tmp_cache=$(mktemp "${cache_file}.XXXXXX" 2>/dev/null)
-    if [ -n "$tmp_cache" ]; then
-      printf '%s\037%s\037%s\037%s\037%s\037%s\037%s' \
-        "$git_branch" "$git_worktree" "$git_added" "$git_removed" "$gitdir" "$head_now" "$now_ts" > "$tmp_cache" \
-        && mv "$tmp_cache" "$cache_file"
-    fi
+    tmp_cache="${cache_file}.$$"
+    printf '%s\037%s\037%s\037%s\037%s\037%s\037%s' \
+      "$git_branch" "$git_worktree" "$git_added" "$git_removed" "$gitdir" "$head_now" "$now_ts" > "$tmp_cache" 2>/dev/null \
+      && mv "$tmp_cache" "$cache_file"
   fi
 fi
 
@@ -592,8 +619,14 @@ installed_version="${CLAUDE_SL_INSTALLED_VERSION-}"
 if [ -z "${CLAUDE_SL_INSTALLED_VERSION+set}" ] && [ -n "$cc_version" ]; then
   claude_bin=$(command -v claude 2>/dev/null)
   if [ -n "$claude_bin" ] && [ -L "$claude_bin" ]; then
-    target=$(readlink "$claude_bin" 2>/dev/null)
-    installed_version="${target##*/}"
+    # Common case first: the symlink already resolves to the running version's binary — a builtin
+    # -ef (same inode) check, no readlink fork. Only a mismatch needs the target's name.
+    if [ "$claude_bin" -ef "$HOME/.local/share/claude/versions/$cc_version" ]; then
+      installed_version="$cc_version"
+    else
+      target=$(readlink "$claude_bin" 2>/dev/null)
+      installed_version="${target##*/}"
+    fi
   fi
 fi
 
@@ -613,19 +646,46 @@ fi
 messaging_name=""
 if [ -n "$session_id" ]; then
   sessions_dir="${CLAUDE_SL_SESSIONS_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions}"
+  # Where the last tick found it, remembered per session so the grep runs once, not every tick.
+  sess_hint="${cache_dir}/claude-sl-sessfile-${session_id//[^A-Za-z0-9._-]/_}"
   sess_file="${sessions_dir}/${PPID}.json"
   sess_json=""
-  [ -r "$sess_file" ] && sess_json=$(<"$sess_file")
+  [ -r "$sess_file" ] && IFS= read -r -d '' sess_json < "$sess_file"
+  if [[ "$sess_json" != *"\"$session_id\""* ]] && [ -f "$sess_hint" ]; then
+    IFS= read -r sess_file < "$sess_hint"
+    sess_json=""
+    [ -r "$sess_file" ] && IFS= read -r -d '' sess_json < "$sess_file"
+  fi
   if [[ "$sess_json" != *"\"$session_id\""* ]] && [ -d "$sessions_dir" ]; then
     sess_file=$(grep -lF -- "\"$session_id\"" "$sessions_dir"/*.json 2>/dev/null)
     sess_file="${sess_file%%$'\n'*}"
     sess_json=""
-    [ -n "$sess_file" ] && sess_json=$(<"$sess_file")
+    if [ -n "$sess_file" ]; then
+      IFS= read -r -d '' sess_json < "$sess_file"
+      printf '%s\n' "$sess_file" > "$sess_hint" 2>/dev/null
+    fi
   fi
   if [[ "$sess_json" == *"\"$session_id\""* ]] \
      && [[ "$sess_json" =~ \"name\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
     messaging_name="${BASH_REMATCH[1]}"
   fi
+fi
+
+# --- Daily cache prune ---
+# Every session leaves small files behind: a seen-record and session-file hint per session id, a
+# git cache per directory ever rendered, and a temp file if a tick was killed between write and
+# mv. macOS empties $TMPDIR of untouched files after a few days; Linux's /tmp often isn't cleaned
+# until reboot. So once a day (stamp file, builtin read) a detached find drops anything of ours
+# untouched for 7 days — every one of these files is rebuilt on demand, so nothing live is lost.
+prune_stamp="${cache_dir}/claude-sl-pruned"
+pruned_at=0
+[ -f "$prune_stamp" ] && read -r pruned_at < "$prune_stamp" 2>/dev/null
+[[ "$pruned_at" =~ ^[0-9]+$ ]] || pruned_at=0
+if (( now_ts - pruned_at >= 86400 )); then
+  printf '%s' "$now_ts" > "$prune_stamp" 2>/dev/null
+  ( find "$cache_dir" -maxdepth 1 \( -name 'claude-sl-*' -o -name '.claude-sl-*' \) \
+      ! -name 'claude-sl-pruned' -mtime +7 -exec rm -rf {} + ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null
 fi
 
 # --- Build rows ---
@@ -638,15 +698,15 @@ fi
 session_row=()
 usage_row=()
 
-# Model, with the effort level beside it in grey ("◆ Opus 5.5 medium") — both describe what's running
+# Model, with the effort level and fast mode beside it in grey ("◆ Opus 5.5 medium fast") — all
+# three describe what's running
+model_mods=""
+[ -n "$effort" ] && model_mods="$effort"
+[ -n "$fast_mode" ] && model_mods="${model_mods:+$model_mods }fast"
 if [ -n "$model" ]; then
-  if [ -n "$effort" ]; then
-    session_row+=("${C_ORANGE}◆ ${model}${C_RESET} ${C_GREY}${effort}${C_RESET}")
-  else
-    session_row+=("${C_ORANGE}◆ ${model}${C_RESET}")
-  fi
-elif [ -n "$effort" ]; then
-  session_row+=("${C_GREY}${effort}${C_RESET}")
+  session_row+=("${C_ORANGE}◆ ${model}${C_RESET}${model_mods:+ ${C_GREY}${model_mods}${C_RESET}}")
+elif [ -n "$model_mods" ]; then
+  session_row+=("${C_GREY}${model_mods}${C_RESET}")
 fi
 
 # Location: directory + worktree label + git branch as ONE segment, joined by plain spaces
@@ -680,6 +740,18 @@ if [ -n "$git_branch" ]; then
   else
     location="${C_LAVENDER}⎇ ${git_branch}${C_RESET}"
   fi
+fi
+# The branch's open pull request, from Claude Code's own PR lookup (payload .pr): "#123", plus its
+# review state in grey when GitHub reports one ("#123 approved", "#123 changes requested").
+if [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+  pr_label="${C_LAVENDER}#${pr_number}${C_RESET}"
+  if [ -n "$pr_review" ]; then
+    pr_review="${pr_review//_/ }"
+    if (( BASH_VERSINFO[0] >= 4 )); then pr_review="${pr_review,,}"
+    else pr_review=$(printf '%s' "$pr_review" | tr '[:upper:]' '[:lower:]'); fi
+    pr_label="${pr_label} ${C_GREY}${pr_review}${C_RESET}"
+  fi
+  location="${location:+$location }${pr_label}"
 fi
 if [ -n "$location" ]; then
   session_row+=("$location")
