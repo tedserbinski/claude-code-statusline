@@ -50,13 +50,13 @@ run_test() {
     errors="${errors}\n    EXIT CODE: $exit_code (expected 0)"
   fi
 
-  # Test 2: at most 2 rows of output (location row + status row), no trailing newline
+  # Test 2: at most 3 rows of output (row 1 + row 2 + the spacer row), no trailing newline
   local line_count
   line_count=$(printf '%s' "$stdout" | wc -l | tr -d ' ')
   # wc -l counts newlines; $( ) strips a trailing one, so check the raw tail separately.
-  # Two rows with no trailing newline = 1.
-  if [ "$line_count" -gt 1 ]; then
-    errors="${errors}\n    LINE COUNT: $((line_count + 1)) rows (expected ≤ 2)"
+  # Three rows with no trailing newline = 2.
+  if [ "$line_count" -gt 2 ]; then
+    errors="${errors}\n    LINE COUNT: $((line_count + 1)) rows (expected ≤ 3)"
   fi
   if [ "$(echo "$json" | bash "$SCRIPT" 2>/dev/null | tail -c 1 | od -An -c | tr -d ' ')" = '\n' ]; then
     errors="${errors}\n    TRAILING NEWLINE: present"
@@ -934,7 +934,7 @@ fi
 # --- Scenario 16b2: Pending update shows the version a restart brings, not the running one ---
 TOTAL=$((TOTAL + 1))
 out=$(echo '{"model":{"display_name":"x"},"version":"2.1.0"}' | CLAUDE_SL_INSTALLED_VERSION="2.1.5" bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
-if [[ "$out" == *" · v2.1.5 ↑" ]] && [[ "$out" != *"2.1.0"* ]]; then
+if [[ "${out%$'\n' }" == *" · v2.1.5 ↑" ]] && [[ "$out" != *"2.1.0"* ]]; then
   PASS=$((PASS + 1))
   printf "  \033[32m✓\033[0m Update pending: shows v2.1.5 ↑, hides the running 2.1.0\n"
 else
@@ -950,7 +950,7 @@ printf '{\n  "pid": 4242,\n  "sessionId": "abc12345-def6",\n  "name": "repo-d4",
 out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"x"},"session_id":"abc12345-def6","session_name":"renamed"}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 other=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"x"},"session_id":"ffff0000-1111"}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 rm -f "$CLAUDE_SL_SESSIONS_DIR/4242.json"
-if [[ "$out" == *" · @repo-d4" ]] && [[ "$other" == *" · #ffff0000" ]]; then
+if [[ "${out%$'\n' }" == *" · @repo-d4" ]] && [[ "${other%$'\n' }" == *" · #ffff0000" ]]; then
   PASS=$((PASS + 1))
   printf "  \033[32m✓\033[0m Messaging name shown (@repo-d4); unregistered session falls back to #id\n"
 else
@@ -969,16 +969,29 @@ else
   printf "  \033[31m✗\033[0m Path should be shown in full — output: %s\n" "$out"
 fi
 
-# --- Scenario 16e: Fast mode joins effort beside the model; the PR and its review state follow the branch ---
+# --- Scenario 16e: Fast mode joins effort beside the model; the PR is left to Claude Code's footer ---
 TOTAL=$((TOTAL + 1))
-out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"effort":{"level":"high"},"fast_mode":true,"pr":{"number":42,"url":"https://x/42","review_state":"CHANGES_REQUESTED"}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
-plain=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"fast_mode":false,"pr":{"number":7}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
-if [[ "$out" == "◆ Opus 5.5 high fast · /tmp · PR #42 changes requested"* ]] && [[ "$plain" == "◆ Opus 5.5 · /tmp · PR #7"$'\n'* ]]; then
+out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"effort":{"level":"high"},"fast_mode":true,"pr":{"number":42,"url":"https://x/42","review_state":"APPROVED"}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+plain=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"fast_mode":false}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+if [[ "$out" == "◆ Opus 5.5 high fast · /tmp"$'\n'* ]] && [[ "$out" != *"42"* ]] && [[ "$plain" == "◆ Opus 5.5 · /tmp"$'\n'* ]]; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Fast mode beside effort; PR #42 + review state as its own segment after the location\n"
+  printf "  \033[32m✓\033[0m Fast mode beside effort; PR not duplicated (Claude Code links it)\n"
 else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Fast/PR rendering — output: %s / %s\n" "$out" "$plain"
+fi
+
+# --- Scenario 16e2: Spacer row after row 2, and CLAUDE_SL_SPACER=0 removes it ---
+TOTAL=$((TOTAL + 1))
+sp_on=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"x"}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+sp_off=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"x"}}' | CLAUDE_SL_SPACER=0 bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+if [ "$(printf '%s\n' "$sp_on" | sed -n 3p)" = " " ] && [ "$(printf '%s' "$sp_on" | wc -l | tr -d ' ')" = 2 ] \
+   && [ "$(printf '%s' "$sp_off" | wc -l | tr -d ' ')" = 1 ]; then
+  PASS=$((PASS + 1))
+  printf "  \033[32m✓\033[0m Spacer row present by default, off with CLAUDE_SL_SPACER=0\n"
+else
+  FAIL=$((FAIL + 1))
+  printf "  \033[31m✗\033[0m Spacer row wrong — on: %q / off: %q\n" "$sp_on" "$sp_off"
 fi
 
 # --- Scenario 16f: An idle tick replaying the same numbers doesn't rewrite the shared snapshot ---
@@ -1040,7 +1053,7 @@ redraw_fail_iter=0
 for i in $(seq 1 20); do
   out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 4.6"},"context_window":{"used_percentage":42},"rate_limits":{"five_hour":{"used_percentage":15}},"output_style":"Learning","session_name":"test"}' | bash "$SCRIPT" 2>/dev/null)
   lc=$(printf '%s' "$out" | wc -l | tr -d ' ')
-  if [ "$lc" -ne 1 ]; then
+  if [ "$lc" -ne 2 ]; then
     redraw_pass=false
     redraw_fail_iter=$i
     break
@@ -1049,7 +1062,7 @@ done
 TOTAL=$((TOTAL + 1))
 if $redraw_pass; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Rapid redraw (20x) — always two rows\n"
+  printf "  \033[32m✓\033[0m Rapid redraw (20x) — always two rows + spacer\n"
 else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Rapid redraw — wrong row count at iteration %d\n" "$redraw_fail_iter"

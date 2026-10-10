@@ -112,9 +112,7 @@ eval "$(echo "$input" | jq -r '
   @sh "seven_day_pct=\(.rate_limits.seven_day.used_percentage // "")",
   @sh "seven_day_reset=\(.rate_limits.seven_day.resets_at // 0)",
   @sh "cc_version=\(.version // "")",
-  @sh "fast_mode=\(if .fast_mode == true then "1" else "" end)",
-  @sh "pr_number=\(.pr.number // "")",
-  @sh "pr_review=\(.pr.review_state // "")"
+  @sh "fast_mode=\(if .fast_mode == true then "1" else "" end)"
 ')"
 model="${model#Claude }"
 # Compact any "(1M context)" / "(200K context)" annotation to just the size token, so every
@@ -743,20 +741,6 @@ if [ -n "$location" ]; then
   session_row+=("$location")
 fi
 
-# The branch's open pull request, from Claude Code's own PR lookup (payload .pr) — its own segment
-# so the number doesn't read as part of the branch name: "PR #123", plus its review state in grey
-# when GitHub reports one ("PR #123 approved", "PR #123 changes requested").
-if [[ "$pr_number" =~ ^[0-9]+$ ]]; then
-  pr_label="${C_LAVENDER}PR #${pr_number}${C_RESET}"
-  if [ -n "$pr_review" ]; then
-    pr_review="${pr_review//_/ }"
-    if (( BASH_VERSINFO[0] >= 4 )); then pr_review="${pr_review,,}"
-    else pr_review=$(printf '%s' "$pr_review" | tr '[:upper:]' '[:lower:]'); fi
-    pr_label="${pr_label} ${C_GREY}${pr_review}${C_RESET}"
-  fi
-  session_row+=("$pr_label")
-fi
-
 # Lines changed (real git diff vs the branch's fork point — committed + uncommitted).
 # Hidden on a clean tree so +0/-0 never adds noise.
 if [ "${git_added:-0}" != "0" ] || [ "${git_removed:-0}" != "0" ]; then
@@ -827,6 +811,10 @@ fi
 join_parts "${usage_row[@]}"
 [ -n "$line" ] && line="${line}\033[0m\n\033[0m"
 line="${line}${_joined}"
+# A spacer row after row 2 separates the statusline from Claude Code's own footer below it (mode,
+# shells, agents, the PR link, workflow progress). It's a reset plus a space rather than a bare
+# trailing newline, which Claude Code may count or trim unpredictably. CLAUDE_SL_SPACER=0 turns it off.
+[ "${CLAUDE_SL_SPACER-1}" != "0" ] && line="${line}\033[0m\n\033[0m "
 # Leading reset overrides Claude Code's dim styling (pattern from ccstatusline); repeated at the
-# start of row 2 above so it isn't dimmed either.
+# start of each row above so none is dimmed.
 printf '\033[0m%b\033[0m' "$line"
