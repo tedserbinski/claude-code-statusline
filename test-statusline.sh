@@ -973,9 +973,9 @@ fi
 TOTAL=$((TOTAL + 1))
 out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"effort":{"level":"high"},"fast_mode":true,"pr":{"number":42,"url":"https://x/42","review_state":"CHANGES_REQUESTED"}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 plain=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"fast_mode":false,"pr":{"number":7}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
-if [[ "$out" == "◆ Opus 5.5 high fast · /tmp #42 changes requested"* ]] && [[ "$plain" == "◆ Opus 5.5 · /tmp #7"$'\n'* ]]; then
+if [[ "$out" == "◆ Opus 5.5 high fast · /tmp · PR #42 changes requested"* ]] && [[ "$plain" == "◆ Opus 5.5 · /tmp · PR #7"$'\n'* ]]; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Fast mode beside effort; PR #42 + review state after the location\n"
+  printf "  \033[32m✓\033[0m Fast mode beside effort; PR #42 + review state as its own segment after the location\n"
 else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Fast/PR rendering — output: %s / %s\n" "$out" "$plain"

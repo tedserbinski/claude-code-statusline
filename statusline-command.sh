@@ -104,7 +104,6 @@ eval "$(echo "$input" | jq -r '
   @sh "model=\(.model.display_name // "")",
   @sh "ctx_pct=\(.context_window.used_percentage // "")",
   @sh "output_style=\((.output_style | if type == "object" then .name // "" else . // "" end))",
-  @sh "vim_mode=\(.vim.mode // "")",
   @sh "session_name=\(.session_name // "")",
   @sh "session_id=\(.session_id // "")",
   @sh "effort=\((.effort | if type == "object" then .level else . end) // .effortLevel // .effort_level // "")",
@@ -690,7 +689,7 @@ fi
 # --- Build rows ---
 # Two rows, each read left to right from what you check most to what you only need now and then:
 #   row 1 — what and where: model + effort · dir ↳ worktree ⎇ branch · lines changed
-#   row 2 — gauges, then reference: context · 5-hour · weekly · style · vim · messaging name · version
+#   row 2 — gauges, then reference: context · 5-hour · weekly · style · messaging name · pending update
 # Row 2 always opens with the context gauge, so the bars sit in the same columns whatever the model
 # or path. A single long row got cut off by Claude Code in deep directories, and the script can't
 # learn the terminal width to adapt.
@@ -740,20 +739,22 @@ if [ -n "$git_branch" ]; then
     location="${C_LAVENDER}⎇ ${git_branch}${C_RESET}"
   fi
 fi
-# The branch's open pull request, from Claude Code's own PR lookup (payload .pr): "#123", plus its
-# review state in grey when GitHub reports one ("#123 approved", "#123 changes requested").
+if [ -n "$location" ]; then
+  session_row+=("$location")
+fi
+
+# The branch's open pull request, from Claude Code's own PR lookup (payload .pr) — its own segment
+# so the number doesn't read as part of the branch name: "PR #123", plus its review state in grey
+# when GitHub reports one ("PR #123 approved", "PR #123 changes requested").
 if [[ "$pr_number" =~ ^[0-9]+$ ]]; then
-  pr_label="${C_LAVENDER}#${pr_number}${C_RESET}"
+  pr_label="${C_LAVENDER}PR #${pr_number}${C_RESET}"
   if [ -n "$pr_review" ]; then
     pr_review="${pr_review//_/ }"
     if (( BASH_VERSINFO[0] >= 4 )); then pr_review="${pr_review,,}"
     else pr_review=$(printf '%s' "$pr_review" | tr '[:upper:]' '[:lower:]'); fi
     pr_label="${pr_label} ${C_GREY}${pr_review}${C_RESET}"
   fi
-  location="${location:+$location }${pr_label}"
-fi
-if [ -n "$location" ]; then
-  session_row+=("$location")
+  session_row+=("$pr_label")
 fi
 
 # Lines changed (real git diff vs the branch's fork point — committed + uncommitted).
@@ -789,11 +790,6 @@ fi
 # Output style (hidden when default)
 if [ -n "$output_style" ] && [ "$output_style" != "default" ]; then
   usage_row+=("\033[35m☰${output_style}${C_RESET}")
-fi
-
-# Vim mode
-if [ -n "$vim_mode" ]; then
-  usage_row+=("${C_GREY}vim:${vim_mode}${C_RESET}")
 fi
 
 # Session: the messaging name other sessions use to reach this one — reference info, just before
