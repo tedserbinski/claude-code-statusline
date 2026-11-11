@@ -61,10 +61,19 @@ build_bar() {
 # Round a possibly-fractional percentage to an int in _pct_int, clamped to 0–100: the API can
 # report fractionally over 100 when a window is fully spent (e.g. 100.6 → "101%"), and a
 # bar/percentage past 100 reads as a bug, not a state. Garbage input clamps to 0.
+# Rounded with string ops rather than printf "%.0f": printf parses numbers in the user's locale, so
+# under a comma-decimal one (de_DE, fr_FR, …) "42.6" is an invalid number — it printed an error
+# and truncated to 42. Negative, exponent-form (jq prints tiny values as 1e-05) and non-numeric
+# input all fall through to 0.
 clamp_pct() {
-  printf -v _pct_int "%.0f" "${1:-0}" 2>/dev/null
-  _pct_int=${_pct_int:-0}
-  (( _pct_int < 0 )) && _pct_int=0
+  local v="${1:-0}" frac=""
+  _pct_int=0
+  [[ "$v" == *.* ]] && frac="${v#*.}"
+  v="${v%%.*}"
+  if [[ "$v" =~ ^[0-9]{1,6}$ ]] && [[ "$frac" =~ ^[0-9]*$ ]]; then
+    _pct_int=$(( 10#$v ))
+    [[ "$frac" == [5-9]* ]] && _pct_int=$(( _pct_int + 1 ))
+  fi
   (( _pct_int > 100 )) && _pct_int=100
 }
 
@@ -83,41 +92,89 @@ build_rate_segment() {
     # Trust the reset only when it's in the future and no further out than the window itself
     # (guards stale/garbage timestamps).
     if (( reset_ts > now_ts && reset_ts - now_ts <= window )); then
-      # Within 24h → clock time (%l:%M%p), even across midnight; further out → month/day (%b %e).
+      # Within 24h → clock time (%I:%M%p), even across midnight; further out → month/day (%b %e).
       # The choice is by time-to-reset, NOT calendar date — a 5h window resetting at 1am tomorrow
       # should read "1:10am", not "May 27". Both formats come from one formatting call:
       # bash 4.2+ formats the time itself (printf %(…)T — no fork, and portable: GNU date's -r
       # means "a file's mtime", not "this epoch"). Stock macOS bash 3.2 falls back to BSD date -r.
+      # Only POSIX conversions are used (%I, not the %l extension some libcs lack), and the 24-hour
+      # form rides along because %p is EMPTY in locales with no am/pm (de_DE, fr_FR, …), where a
+      # bare "8:10" would be ambiguous.
       local fmt
       if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2) )); then
-        printf -v fmt '%(%l:%M%p|%b %e)T' "$reset_ts"
+        printf -v fmt '%(%I:%M%p|%H:%M|%b %e)T' "$reset_ts"
       else
-        fmt=$(date -r "$reset_ts" '+%l:%M%p|%b %e')
+        fmt=$(date -r "$reset_ts" '+%I:%M%p|%H:%M|%b %e')
       fi
-      local r
-      if (( reset_ts - now_ts <= 86400 )); then r="${fmt%%|*}"; else r="${fmt#*|}"; fi
-      r="${r//  / }"; r="${r# }"; r="${r//AM/am}"; r="${r//PM/pm}"   # "  8:10PM" → "8:10pm"
+      local r="${fmt%%|*}" rest="${fmt#*|}"
+      if (( reset_ts - now_ts > 86400 )); then
+        r="${rest#*|}"
+      elif [[ "$r" == *[0-9] ]]; then
+        r="${rest%%|*}"                                   # no am/pm in this locale → "20:10"
+      else
+        r="${r#0}"; r="${r//AM/am}"; r="${r//PM/pm}"      # "08:10PM" → "8:10pm"
+      fi
+      r="${r//  / }"; r="${r# }"                          # "Jun  1" → "Jun 1"
       reset=" ${C_GREY}↻${r}${C_RESET}"
     fi
   fi
   _rate_segment="${_pct_color}${glyph} ${u_int}%${C_RESET} ${_bar_result}${reset}"
 }
 
+# --- Find jq ---
+# jq is the one process every tick starts, so which jq matters. Version-manager shims (mise, asdf,
+# …) are wrapper scripts that take longer to launch than jq takes to run — 17 ms against 3 ms for
+# the real binary, half of a whole render — so a jq in a ".../shims" directory is passed over when
+# a real one exists anywhere. The usual install locations are searched after $PATH too, because
+# Claude Code started from a GUI launcher or an IDE often gets a minimal PATH without Homebrew's
+# bin. All builtin tests, no fork. CLAUDE_SL_JQ pins the binary.
+find_jq() {
+  jq_bin="${CLAUDE_SL_JQ-}"
+  if [ -n "$jq_bin" ]; then [ -x "$jq_bin" ]; return; fi
+  local IFS=: dir shim=""
+  set -f   # no globbing while $PATH is split on ":"
+  for dir in $PATH /usr/bin /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/.nix-profile/bin"; do
+    [ -n "$dir" ] && [ -f "$dir/jq" ] && [ -x "$dir/jq" ] || continue
+    case "$dir" in
+      */shims|*/shims/*) [ -n "$shim" ] || shim="$dir/jq" ;;
+      *) jq_bin="$dir/jq"; break ;;
+    esac
+  done
+  set +f
+  [ -n "$jq_bin" ] || jq_bin="$shim"
+  [ -n "$jq_bin" ]
+}
+if ! find_jq; then
+  # Say so, rather than render a row of empty gauges that looks like a Claude Code problem.
+  printf '%s' "${C_RESET}${C_YELLOW}statusline: jq not found — install jq (brew install jq / apt install jq)${C_RESET}"
+  exit 0
+fi
+
 # --- Extract all fields in a single jq call ---
-eval "$(jq -r '
-  @sh "cwd=\(.workspace.current_dir // .cwd // "")",
-  @sh "model=\(.model.display_name // "")",
-  @sh "ctx_pct=\(.context_window.used_percentage // "")",
-  @sh "output_style=\((.output_style | if type == "object" then .name // "" else . // "" end))",
-  @sh "session_id=\(.session_id // "")",
-  @sh "effort=\((.effort | if type == "object" then .level else . end) // .effortLevel // .effort_level // "")",
-  @sh "five_hour_pct=\(.rate_limits.five_hour.used_percentage // "")",
-  @sh "five_hour_reset=\(.rate_limits.five_hour.resets_at // 0)",
-  @sh "seven_day_pct=\(.rate_limits.seven_day.used_percentage // "")",
-  @sh "seven_day_reset=\(.rate_limits.seven_day.resets_at // 0)",
-  @sh "cc_version=\(.version // "")",
-  @sh "fast_mode=\(if .fast_mode == true then "1" else "" end)"
-' <<< "$input")"
+# Every field is read through a helper that turns "wrong shape" into "missing": the payload has
+# changed shape between Claude Code versions before (effort and output_style have each been a
+# string and an object), and one jq type error would otherwise abort the whole program and blank
+# every field after it. s() keeps strings and numbers, p() keeps numbers, n() keeps a whole number
+# (an epoch).
+cwd="" model="" ctx_pct="" output_style="" session_id="" effort="" cc_version="" fast_mode=""
+five_hour_pct="" five_hour_reset=0 seven_day_pct="" seven_day_reset=0
+eval "$("$jq_bin" -r '
+  def s(f): (try f catch null) | if type == "string" or type == "number" then . else "" end;
+  def p(f): (try f catch null) | if type == "number" then . else "" end;
+  def n(f): (try f catch null) | if type == "number" then floor else 0 end;
+  @sh "cwd=\((s(.workspace.current_dir) | select(. != "")) // s(.cwd))",
+  @sh "model=\(s(.model.display_name))",
+  @sh "ctx_pct=\(p(.context_window.used_percentage))",
+  @sh "output_style=\(s(.output_style | if type == "object" then .name else . end))",
+  @sh "session_id=\(s(.session_id))",
+  @sh "effort=\(s((.effort | if type == "object" then .level else . end) // .effortLevel // .effort_level))",
+  @sh "five_hour_pct=\(p(.rate_limits.five_hour.used_percentage))",
+  @sh "five_hour_reset=\(n(.rate_limits.five_hour.resets_at))",
+  @sh "seven_day_pct=\(p(.rate_limits.seven_day.used_percentage))",
+  @sh "seven_day_reset=\(n(.rate_limits.seven_day.resets_at))",
+  @sh "cc_version=\(s(.version))",
+  @sh "fast_mode=\(if (try .fast_mode catch null) == true then "1" else "" end)"
+' <<< "$input" 2>/dev/null)"
 model="${model#Claude }"
 # Compact any "(1M context)" / "(200K context)" annotation to just the size token, so every
 # model name stays short regardless of tier: "Opus 4.7 (1M context)" → "Opus 4.7 1M".
@@ -126,16 +183,33 @@ if [[ "$model" =~ ^(.+)\ \(([0-9]+[KMkm])\ context\)$ ]]; then
 fi
 
 # --- Cache directory ---
-# Every cache below lives here. macOS's $TMPDIR is already per-user; on Linux it's usually unset and
-# /tmp is shared by every user, so the caches get a private per-uid directory there (created once,
-# mode 700). CLAUDE_SL_CACHE_DIR overrides it (the test suite uses this for isolation).
+# Every cache below lives here. macOS's $TMPDIR is already private to the user and is used as is.
+# Anywhere the temp dir is shared — Linux, where $TMPDIR is usually unset and /tmp belongs to
+# everyone, or a $TMPDIR pointed at /tmp — the caches get a private per-uid subdirectory (created
+# once, mode 700). "Shared" is judged with builtin tests: not ours (-O), or sticky (-k) like /tmp.
+# The subdirectory is only trusted when it's a real directory we own: cache files are written
+# under predictable names, so a directory another user created first (or a symlink they planted)
+# would let them read usage data or redirect our writes. If the temp dir is missing or read-only
+# (a stale $TMPDIR, a sandbox), fall back to ~/.cache — with no writable cache every tick would
+# re-run git and nothing would sync between sessions.
+# CLAUDE_SL_CACHE_DIR overrides it (the test suite uses this for isolation).
+private_dir() {   # $1 = directory to create if needed; succeeds only if it's ours and writable
+  # shellcheck disable=SC2174  # -m applying to the leaf only is what's wanted
+  [ -d "$1" ] || mkdir -p -m 700 "$1" 2>/dev/null
+  [ -d "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] && [ -w "$1" ]
+}
 if [ -n "${CLAUDE_SL_CACHE_DIR-}" ]; then
   cache_dir="$CLAUDE_SL_CACHE_DIR"
-elif [ -n "${TMPDIR-}" ]; then
-  cache_dir="${TMPDIR%/}"
 else
-  cache_dir="/tmp/claude-sl-${UID:-$(id -u)}"
-  [ -d "$cache_dir" ] || mkdir -m 700 "$cache_dir" 2>/dev/null || cache_dir="/tmp"
+  cache_dir="${TMPDIR:-/tmp}"
+  [ "$cache_dir" = "/" ] || cache_dir="${cache_dir%/}"
+  if ! { [ -d "$cache_dir" ] && [ -O "$cache_dir" ] && [ -w "$cache_dir" ] && [ ! -k "$cache_dir" ]; }; then
+    if private_dir "${cache_dir%/}/claude-sl-${UID}"; then
+      cache_dir="${cache_dir%/}/claude-sl-${UID}"
+    elif private_dir "${XDG_CACHE_HOME:-$HOME/.cache}/claude-sl"; then
+      cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sl"
+    fi
+  fi
 fi
 
 # --- Which Claude account is logged in? ---
@@ -154,7 +228,15 @@ if [ -z "${CLAUDE_SL_ACCOUNT+set}" ]; then
   # Record format: "<checked_at>\037<account>". The check time lives in the file so its age costs a
   # builtin read rather than a stat fork. A file from an older version (bare account) reads as
   # never checked and is refreshed.
+  # Sessions started with different CLAUDE_CONFIG_DIRs are different logins running side by side,
+  # so each config dir gets its own record — one shared record would hand profile A's account to
+  # profile B for up to 5s, and B would then publish its usage into A's snapshot.
   acct_cache="${cache_dir}/claude-sl-account"
+  if [ -n "${CLAUDE_CONFIG_DIR-}" ]; then
+    acct_key="${CLAUDE_CONFIG_DIR//[^A-Za-z0-9._-]/_}"
+    (( ${#acct_key} > 100 )) && acct_key="${acct_key: -100}"
+    acct_cache="${acct_cache}-${acct_key}"
+  fi
   acct_at="" cached_account=""
   [ -f "$acct_cache" ] && IFS=$'\037' read -r acct_at cached_account < "$acct_cache" 2>/dev/null
   [[ "$acct_at" =~ ^[0-9]+$ ]] || acct_at=0
@@ -162,7 +244,7 @@ if [ -z "${CLAUDE_SL_ACCOUNT+set}" ]; then
     cc_config="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
     if [ -r "$cc_config" ]; then
       # Indexing a missing/null .oauthAccount yields null in jq, so this stays quiet when logged out.
-      account=$(jq -r '.oauthAccount.accountUuid // .oauthAccount.emailAddress // ""' "$cc_config" 2>/dev/null)
+      account=$("$jq_bin" -r '.oauthAccount.accountUuid // .oauthAccount.emailAddress // ""' "$cc_config" 2>/dev/null)
     fi
     # Reduce to a safe filename component — the uuid already is one, an email address isn't.
     account="${account//[^A-Za-z0-9._-]/_}"
@@ -318,7 +400,7 @@ fi
 # observation on hand is older than CLAUDE_SL_USAGE_TTL seconds (default 180 — this endpoint 429s
 # aggressively when polled faster; active sessions refresh from headers every turn, so in practice
 # it fires only while idle). One fetch per account at a time (mkdir lock), failures back off for
-# 10 minutes, and the result is cached per account. Set CLAUDE_SL_USAGE_TTL=0 to disable the
+# 10 minutes (a missing or expired token for 1), and the result is cached per account. Set CLAUDE_SL_USAGE_TTL=0 to disable the
 # endpoint entirely; CLAUDE_SL_USAGE_TOKEN / CLAUDE_SL_USAGE_URL override the token and URL (the
 # test suite points the URL at a local fixture).
 usage_ttl="${CLAUDE_SL_USAGE_TTL-180}"
@@ -340,15 +422,24 @@ read_oauth_token() {
   _token="${CLAUDE_SL_USAGE_TOKEN-}"
   [ -n "$_token" ] && return 0
   local creds=""
-  if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
-    creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+  if [[ "${OSTYPE-}" == darwin* ]]; then
+    # With CLAUDE_CONFIG_DIR set, Claude Code stores that profile's login under its own Keychain
+    # item: the service name gains "-<first 8 hex of sha256(config dir)>". Reading the plain item
+    # there would fetch the DEFAULT profile's usage and file it under this profile's account. If
+    # the hash can't be computed the lookup simply misses — it never falls back to the plain item.
+    local service="Claude Code-credentials" dir_hash
+    if [ -n "${CLAUDE_CONFIG_DIR-}" ]; then
+      dir_hash=$(printf '%s' "$CLAUDE_CONFIG_DIR" | shasum -a 256 2>/dev/null)
+      service="${service}-${dir_hash:0:8}"
+    fi
+    creds=$(security find-generic-password -s "$service" -w 2>/dev/null)
   fi
   if [ -z "$creds" ]; then
     local creds_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
     [ -r "$creds_file" ] && creds=$(cat "$creds_file" 2>/dev/null)
   fi
   [ -n "$creds" ] || return 1
-  _token=$(printf '%s' "$creds" | jq -r --argjson now_ms "$(( now_ts * 1000 ))" '
+  _token=$(printf '%s' "$creds" | "$jq_bin" -r --argjson now_ms "$(( now_ts * 1000 ))" '
     .claudeAiOauth
     | if (.accessToken // "") != "" and ((.expiresAt // 0) == 0 or .expiresAt > $now_ms)
       then .accessToken else "" end' 2>/dev/null)
@@ -369,7 +460,12 @@ fetch_usage_in_background() {
   fi
   (
     trap 'rm -rf "$lock"' EXIT
-    read_oauth_token || exit 0
+    # No usable token (expired until Claude Code's next API call refreshes it, or none stored):
+    # leave a short-lived marker so the Keychain isn't re-queried on every tick meanwhile.
+    if ! read_oauth_token; then
+      printf 'notoken\037%s' "$now_ts" > "${usage_file}.err" 2>/dev/null
+      exit 0
+    fi
     local url="${CLAUDE_SL_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}"
     local resp code body parsed
     # User-Agent matters: without Claude Code's own UA the endpoint answers from a far stricter
@@ -384,7 +480,7 @@ fetch_usage_in_background() {
     # only reads "...SSZ", so strip the fraction and normalise the zero offset; any other offset
     # (or a null) yields 0 = "no anchor". Round a fractional instant UP so it matches the header
     # anchor for the same window (59.77s → :00) instead of rendering a minute earlier.
-    parsed=$(printf '%s' "$body" | jq -r '
+    parsed=$(printf '%s' "$body" | "$jq_bin" -r '
       def epoch: try (
         capture("^(?<b>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.(?<f>[0-9]+))?(?<z>Z|\\+00:00)$") as $m
         | ($m.b + "Z" | fromdateiso8601) + (if (($m.f // "0") | tonumber) > 0 then 1 else 0 end)
@@ -409,12 +505,14 @@ if (( usage_ttl > 0 )) && [ -n "$account" ] && [ -n "$cc_version" ]; then
   for t in "$five_hour_at" "$seven_day_at" "$api_at"; do
     [[ "$t" =~ ^[0-9]+$ ]] && (( t > newest_at )) && newest_at="$t"
   done
-  err_at=0
+  err_at=0 err_code="" backoff=600
   if [ -f "${usage_file}.err" ]; then
-    IFS=$'\037' read -r _ err_at < "${usage_file}.err" 2>/dev/null
+    IFS=$'\037' read -r err_code err_at < "${usage_file}.err" 2>/dev/null
     [[ "$err_at" =~ ^[0-9]+$ ]] || err_at=0
+    # A missing/expired token clears itself on Claude Code's next API call: retry after a minute.
+    [ "$err_code" = "notoken" ] && backoff=60
   fi
-  if (( now_ts - newest_at >= usage_ttl )) && (( now_ts - err_at >= 600 )); then
+  if (( now_ts - newest_at >= usage_ttl )) && (( now_ts - err_at >= backoff )); then
     fetch_usage_in_background
   fi
 fi
@@ -448,7 +546,20 @@ git_worktree=""
 git_added=""
 git_removed=""
 if [ -n "$cwd" ]; then
-  cache_file="${cache_dir}/claude-sl-git${cwd//\//_}"
+  git_key="${cwd//\//_}"
+  # A file name tops out at 255 bytes. A deep path used as the name would make every cache write
+  # fail — silently, so git would run in full on every tick. Long keys become a hash of the whole
+  # path plus its recognisable tail (builtin arithmetic; multi-byte characters can be 4 bytes each,
+  # hence the conservative lengths).
+  if (( ${#git_key} > 60 )); then
+    key_hash=0
+    for (( i = 0; i < ${#git_key}; i++ )); do
+      printf -v key_ch '%d' "'${git_key:i:1}" 2>/dev/null
+      key_hash=$(( (key_hash * 31 + ${key_ch:-0}) & 0x7fffffff ))
+    done
+    git_key="_${key_hash}_${git_key: -40}"
+  fi
+  cache_file="${cache_dir}/claude-sl-git${git_key}"
   c_gitdir=""; c_head=""; c_at=""
   if [ -f "$cache_file" ]; then
     IFS=$'\037' read -r git_branch git_worktree git_added git_removed c_gitdir c_head c_at < "$cache_file" 2>/dev/null
@@ -628,8 +739,11 @@ if [ -z "${CLAUDE_SL_INSTALLED_VERSION+set}" ] && [ -n "$cc_version" ]; then
     if [ "$claude_bin" -ef "$HOME/.local/share/claude/versions/$cc_version" ]; then
       installed_version="$cc_version"
     else
+      # Only the native installer's symlink ends in a version. npm's points at ".../cli.js" and
+      # Homebrew's at ".../claude", which used to render as a permanent "vcli.js ↑".
       target=$(readlink "$claude_bin" 2>/dev/null)
       installed_version="${target##*/}"
+      [[ "$installed_version" =~ ^[0-9]+(\.[0-9]+)+ ]] || installed_version=""
     fi
   fi
 fi

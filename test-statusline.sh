@@ -1014,11 +1014,12 @@ rm -f "$TMPFILE.ref"
 # --- Scenario 16g: Account cache from an older version (bare account, no check time) is refreshed ---
 TOTAL=$((TOTAL + 1))
 acct_dir=$(mktemp -d)
+acct_rec="$CLAUDE_SL_CACHE_DIR/claude-sl-account-${acct_dir//[^A-Za-z0-9._-]/_}"
 printf '{"oauthAccount":{"accountUuid":"acct-new"}}' > "$acct_dir/.claude.json"
-printf 'acct-old' > "$CLAUDE_SL_CACHE_DIR/claude-sl-account"
+printf 'acct-old' > "$acct_rec"
 echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":33,\"resets_at\":$(( $(date +%s) + 3600 ))}}}" \
   | env -u CLAUDE_SL_ACCOUNT CLAUDE_CONFIG_DIR="$acct_dir" bash "$SCRIPT" >/dev/null 2>&1
-acct_line=$(tr '\037' ' ' < "$CLAUDE_SL_CACHE_DIR/claude-sl-account")
+acct_line=$(tr '\037' ' ' < "$acct_rec")
 if [[ "$acct_line" =~ ^[0-9]+\ acct-new$ ]] && [ -f "$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-new" ]; then
   PASS=$((PASS + 1))
   printf "  \033[32m✓\033[0m Legacy account cache refreshed into <checked_at><sep><account>\n"
@@ -1026,7 +1027,7 @@ else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Account cache not refreshed — got: %s\n" "$acct_line"
 fi
-rm -rf "$acct_dir" "$CLAUDE_SL_CACHE_DIR/claude-sl-account" "$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-new" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+rm -rf "$acct_dir" "$acct_rec" "$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-new" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
 
 # --- Scenario 16h: Daily prune drops our files untouched for 7+ days, keeps fresh ones ---
 TOTAL=$((TOTAL + 1))
@@ -1056,6 +1057,143 @@ else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Backslash content mangled — output: %q\n" "$out"
 fi
+
+
+# --- Portability scenarios: other locales, other installs, odd payloads, odd temp dirs ---
+check() {  # $1 = label, $2 = "ok" when the condition held, $3 = detail shown on failure
+  TOTAL=$((TOTAL + 1))
+  if [ "$2" = "ok" ]; then
+    PASS=$((PASS + 1)); printf "  \033[32m✓\033[0m %s\n" "$1"
+  else
+    FAIL=$((FAIL + 1)); printf "  \033[31m✗\033[0m %s — %s\n" "$1" "$3"
+  fi
+}
+port_now=$(date +%s)
+port_json="{\"model\":{\"display_name\":\"x\"},\"context_window\":{\"used_percentage\":42.6},\"rate_limits\":{\"five_hour\":{\"used_percentage\":7.5,\"resets_at\":$((port_now + 3600))}}}"
+fresh_rate() { rm -f "$RATE_CACHE" "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*; }
+
+# P1: a comma-decimal locale must not truncate "42.6" (printf %.0f rejects it there) or leak an error
+comma_locale=$(locale -a 2>/dev/null | grep -E -m1 '^(de_DE|fr_FR|es_ES|it_IT)\.(UTF-8|utf8)$')
+if [ -n "$comma_locale" ]; then
+  fresh_rate
+  out=$(echo "$port_json" | LC_ALL="$comma_locale" bash "$SCRIPT" 2>"$TMPFILE")
+  if [[ "$out" == *"⛁ 43%"* ]] && [[ "$out" == *"⏱ 8%"* ]] && [ ! -s "$TMPFILE" ]; then r=ok; else r=no; fi
+  check "Comma-decimal locale ($comma_locale) rounds 42.6 → 43%, no stderr" "$r" "$(cat "$TMPFILE") / $out"
+  # P2: that locale has no am/pm, so the reset must be a 24-hour time, not a bare 12-hour one
+  expect24=$(LC_ALL="$comma_locale" date -r "$((port_now + 3600))" '+%H:%M' 2>/dev/null \
+    || LC_ALL="$comma_locale" date -d "@$((port_now + 3600))" '+%H:%M')
+  ampm=$(LC_ALL="$comma_locale" date '+%p')
+  if [ -n "$ampm" ] || [[ "$out" == *"↻${expect24}"* ]]; then r=ok; else r=no; fi
+  check "Locale without am/pm shows a 24-hour reset time" "$r" "wanted ↻$expect24 in: $out"
+fi
+
+# P3: rounding is exact at the edges
+fresh_rate
+out=$(echo '{"context_window":{"used_percentage":99.5},"rate_limits":{"five_hour":{"used_percentage":0.4}}}' | bash "$SCRIPT" 2>/dev/null)
+if [[ "$out" == *"⛁ 100%"* ]] && [[ "$out" == *"⏱ 0%"* ]]; then r=ok; else r=no; fi
+check "Rounding: 99.5 → 100%, 0.4 → 0%" "$r" "$out"
+
+# P4: fields of the wrong type are skipped one by one — the rest still renders, nothing on stderr
+fresh_rate
+out=$(echo '{"model":"Opus","workspace":"nope","cwd":"/tmp","rate_limits":"n/a","effort":["x"],"output_style":7,"context_window":{"used_percentage":"12"},"session_id":"shape-1"}' | bash "$SCRIPT" 2>"$TMPFILE")
+if [[ "$out" == *"/tmp"* ]] && [[ "$out" == *"⛁ --"* ]] && [[ "$out" == *"#shape-1"* ]] && [ ! -s "$TMPFILE" ]; then r=ok; else r=no; fi
+check "Wrong-shaped fields are skipped individually, no stderr" "$r" "$(cat "$TMPFILE") / $out"
+
+# P5: input that isn't JSON at all still yields a quiet two-row statusline
+fresh_rate
+out=$(echo 'not json' | bash "$SCRIPT" 2>"$TMPFILE")
+if [[ "$out" == *"⛁ --"* ]] && [ ! -s "$TMPFILE" ]; then r=ok; else r=no; fi
+check "Non-JSON input renders placeholders, no stderr" "$r" "$(cat "$TMPFILE") / $out"
+
+# P6: no jq → say so instead of rendering empty gauges
+out=$(echo "$port_json" | CLAUDE_SL_JQ=/nonexistent/jq bash "$SCRIPT" 2>"$TMPFILE")
+if [[ "$out" == *"jq not found"* ]] && [ ! -s "$TMPFILE" ]; then r=ok; else r=no; fi
+check "Missing jq is reported on the statusline" "$r" "$out"
+
+# P7: a version-manager shim earlier in PATH is passed over for the real jq
+shim_root=$(mktemp -d); mkdir -p "$shim_root/shims"
+printf '#!/bin/sh\ntouch "%s/shim-ran"\nexec "%s" "$@"\n' "$shim_root" "$(command -v jq)" > "$shim_root/shims/jq"
+chmod +x "$shim_root/shims/jq"
+fresh_rate
+out=$(echo "$port_json" | PATH="$shim_root/shims:$PATH" bash "$SCRIPT" 2>/dev/null)
+real_jq=""
+for d in /usr/bin /opt/homebrew/bin /usr/local/bin; do [ -x "$d/jq" ] && real_jq="$d/jq"; done
+if [[ "$out" == *"⛁ 43%"* ]] && { [ -z "$real_jq" ] || [ ! -e "$shim_root/shim-ran" ]; }; then r=ok; else r=no; fi
+check "jq shim in PATH is skipped when a real jq exists" "$r" "$out"
+# ...and with a PATH that has no jq at all, the usual install locations are still found
+if [ -n "$real_jq" ]; then
+  fresh_rate
+  out=$(echo "$port_json" | PATH="/nonexistent" "$BASH" "$SCRIPT" 2>/dev/null)
+  if [[ "$out" == *"⛁ 43%"* ]]; then r=ok; else r=no; fi
+  check "jq is found outside a minimal PATH" "$r" "$out"
+fi
+rm -rf "$shim_root"
+
+# P8: npm/Homebrew installs — the claude symlink's target isn't a version, so no update marker
+fake_bin=$(mktemp -d)
+mkdir -p "$fake_bin/bin" "$fake_bin/lib/claude-code" "$fake_bin/versions"
+printf '#!/bin/sh\n' > "$fake_bin/lib/claude-code/cli.js"; printf '#!/bin/sh\n' > "$fake_bin/versions/2.1.9"
+chmod +x "$fake_bin/lib/claude-code/cli.js" "$fake_bin/versions/2.1.9"
+ln -s "../lib/claude-code/cli.js" "$fake_bin/bin/claude"
+fresh_rate
+out=$(echo '{"model":{"display_name":"x"},"version":"2.1.0"}' | env -u CLAUDE_SL_INSTALLED_VERSION PATH="$fake_bin/bin:$PATH" bash "$SCRIPT" 2>/dev/null)
+if [[ "$out" != *"↑"* ]]; then r=ok; else r=no; fi
+check "Non-versioned claude symlink (npm/Homebrew) shows no update marker" "$r" "$out"
+rm -f "$fake_bin/bin/claude"; ln -s "$fake_bin/versions/2.1.9" "$fake_bin/bin/claude"
+out=$(echo '{"model":{"display_name":"x"},"version":"2.1.0"}' | env -u CLAUDE_SL_INSTALLED_VERSION PATH="$fake_bin/bin:$PATH" bash "$SCRIPT" 2>/dev/null)
+if [[ "$out" == *"v2.1.9 ↑"* ]]; then r=ok; else r=no; fi
+check "Versioned claude symlink still shows the pending update" "$r" "$out"
+rm -rf "$fake_bin"
+
+# P9: a very deep directory still gets a git cache file (its name must fit in 255 bytes)
+deep_root=$(mktemp -d); deep="$deep_root"
+for i in 1 2 3 4 5 6 7 8; do deep="$deep/$(printf 'segment-%02d-%030d' "$i" 0)"; done
+mkdir -p "$deep"
+rm -f "$CLAUDE_SL_CACHE_DIR"/claude-sl-git*
+echo "{\"workspace\":{\"current_dir\":\"$deep\"}}" | bash "$SCRIPT" >/dev/null 2>&1
+deep_caches=$(find "$CLAUDE_SL_CACHE_DIR" -maxdepth 1 -name 'claude-sl-git*' | wc -l | tr -d ' ')
+check "Deep path (${#deep} chars) still writes its git cache" "$([ "$deep_caches" = 1 ] && echo ok)" "found $deep_caches cache files"
+# ...and two deep paths that differ only at the start don't share one
+deep2="${deep/segment-01/segment-91}"; mkdir -p "$deep2"
+echo "{\"workspace\":{\"current_dir\":\"$deep2\"}}" | bash "$SCRIPT" >/dev/null 2>&1
+deep_caches=$(find "$CLAUDE_SL_CACHE_DIR" -maxdepth 1 -name 'claude-sl-git*' | wc -l | tr -d ' ')
+check "Deep paths with the same tail get separate git caches" "$([ "$deep_caches" = 2 ] && echo ok)" "found $deep_caches cache files"
+rm -rf "$deep_root" "$CLAUDE_SL_CACHE_DIR"/claude-sl-git*
+
+# P10: two CLAUDE_CONFIG_DIRs are two logins — they must not share the cached account lookup
+prof_a=$(mktemp -d); prof_b=$(mktemp -d)
+printf '{"oauthAccount":{"accountUuid":"acct-pa"}}' > "$prof_a/.claude.json"
+printf '{"oauthAccount":{"accountUuid":"acct-pb"}}' > "$prof_b/.claude.json"
+echo "{\"session_id\":\"prof-a\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":11,\"resets_at\":$((port_now + 3600))}}}" \
+  | env -u CLAUDE_SL_ACCOUNT CLAUDE_CONFIG_DIR="$prof_a" bash "$SCRIPT" >/dev/null 2>&1
+echo "{\"session_id\":\"prof-b\",\"rate_limits\":{\"five_hour\":{\"used_percentage\":77,\"resets_at\":$((port_now + 7200))}}}" \
+  | env -u CLAUDE_SL_ACCOUNT CLAUDE_CONFIG_DIR="$prof_b" bash "$SCRIPT" >/dev/null 2>&1
+pa=$(cut -d$'\037' -f1 "$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-pa" 2>/dev/null)
+pb=$(cut -d$'\037' -f1 "$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-pb" 2>/dev/null)
+check "Side-by-side CLAUDE_CONFIG_DIR profiles keep separate accounts" "$([ "$pa" = 11 ] && [ "$pb" = 77 ] && echo ok)" "a=$pa b=$pb"
+
+# P11: with CLAUDE_CONFIG_DIR set and no credentials for that profile, the usage fetch finds no
+# token (it must not borrow the default profile's Keychain item) and leaves a 1-minute marker
+# (the snapshot P10 just published is dropped first: an observation that fresh suppresses the fetch)
+rm -f "$CLAUDE_SL_CACHE_DIR"/claude-sl-usage-acct-pa* "$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-pa"
+echo '{"session_id":"prof-a2","version":"2.1.0"}' \
+  | env -u CLAUDE_SL_ACCOUNT -u CLAUDE_SL_USAGE_TOKEN CLAUDE_SL_USAGE_TTL=1 CLAUDE_SL_USAGE_URL="file:///nonexistent" \
+    CLAUDE_CONFIG_DIR="$prof_a" bash "$SCRIPT" >/dev/null 2>&1
+for i in $(seq 1 100); do [ -f "$CLAUDE_SL_CACHE_DIR/claude-sl-usage-acct-pa.err" ] && break; sleep 0.1; done
+marker=$(cut -d$'\037' -f1 "$CLAUDE_SL_CACHE_DIR/claude-sl-usage-acct-pa.err" 2>/dev/null)
+check "No token for this profile → short backoff marker, default profile's token untouched" "$([ "$marker" = notoken ] && echo ok)" "marker=$marker"
+rm -rf "$prof_a" "$prof_b" "$CLAUDE_SL_CACHE_DIR"/claude-sl-account-* "$CLAUDE_SL_CACHE_DIR"/claude-sl-rate-acct-p? \
+  "$CLAUDE_SL_CACHE_DIR"/claude-sl-usage-acct-pa* "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+
+# P12: a shared (sticky) temp dir gets a private per-uid subdirectory; an unusable one falls back to ~/.cache
+shared_tmp=$(mktemp -d); chmod 1777 "$shared_tmp"; xdg=$(mktemp -d)
+echo "$port_json" | env -u CLAUDE_SL_CACHE_DIR TMPDIR="$shared_tmp" XDG_CACHE_HOME="$xdg" bash "$SCRIPT" >/dev/null 2>&1
+sub="$shared_tmp/claude-sl-$(id -u)"
+loose=$(find "$shared_tmp" -maxdepth 1 -type f | wc -l | tr -d ' ')
+check "Shared temp dir: caches go in a private per-uid subdirectory" "$([ -f "$sub/claude-sl-rate-acct-a" ] && [ "$loose" = 0 ] && echo ok)" "loose files: $loose"
+echo "$port_json" | env -u CLAUDE_SL_CACHE_DIR TMPDIR="/nonexistent/tmp" XDG_CACHE_HOME="$xdg" bash "$SCRIPT" >/dev/null 2>&1
+check "Unusable temp dir: caches fall back to the XDG cache dir" "$([ -f "$xdg/claude-sl/claude-sl-rate-acct-a" ] && echo ok)" "$(ls -A "$xdg")"
+rm -rf "$shared_tmp" "$xdg"
 
 # --- Scenario 17: Rapid redraw (consistency) ---
 echo ""
