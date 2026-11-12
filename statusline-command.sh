@@ -111,6 +111,7 @@ clamp_pct() {
 # absolute time the window resets. No pacing/projection — just "how much used, and when it resets".
 #   ↻1:10am = resets within a day, shown as the clock time (even when it's after midnight).
 #   ↻Jun 1  = resets further out — shown as month/day (the weekly window). Result in _rate_segment.
+_fmt_ts=() _fmt_val=()
 build_rate_segment() {
   # $5 (optional) is extra text placed after the bar and before the reset time.
   local used_raw="$1" reset_ts="$2" window="$3" glyph="$4" extra="${5-}"
@@ -130,11 +131,19 @@ build_rate_segment() {
       # Only POSIX conversions are used (%I, not the %l extension some libcs lack), and the 24-hour
       # form rides along because %p is EMPTY in locales with no am/pm (de_DE, fr_FR, …), where a
       # bare "8:10" would be ambiguous.
-      local fmt
-      if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2) )); then
-        printf -v fmt '%(%I:%M%p|%H:%M|%b %e)T' "$reset_ts"
-      else
-        fmt=$(date -r "$reset_ts" '+%I:%M%p|%H:%M|%b %e')
+      # A narrow terminal rebuilds row 2 up to three more times (shorter bars, no bars, short
+      # labels), so the formatted time is remembered per timestamp — on bash 3.2 each one is a fork.
+      local fmt="" i
+      for (( i = 0; i < ${#_fmt_ts[@]}; i++ )); do
+        [ "${_fmt_ts[i]}" = "$reset_ts" ] && fmt="${_fmt_val[i]}"
+      done
+      if [ -z "$fmt" ]; then
+        if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2) )); then
+          printf -v fmt '%(%I:%M%p|%H:%M|%b %e)T' "$reset_ts"
+        else
+          fmt=$(date -r "$reset_ts" '+%I:%M%p|%H:%M|%b %e')
+        fi
+        _fmt_ts+=("$reset_ts"); _fmt_val+=("$fmt")
       fi
       local r="${fmt%%|*}" rest="${fmt#*|}"
       if (( reset_ts - now_ts > 86400 )); then
