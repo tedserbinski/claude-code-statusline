@@ -8,7 +8,7 @@ A compact, three-row statusline for [Claude Code](https://claude.com/claude-code
 
 **Desktop**
 
-![Three-row statusline in a desktop terminal: folder, branch and lines changed; then the model and effort, context, and the weekly usage bar with the model's own weekly limit in parentheses and the reset date; then the computer, the account and the session's messaging name](screenshot.png)
+![Three-row statusline in a desktop terminal: folder, branch and lines changed; then the model and effort, context, and the weekly usage bar with the model's own weekly limit in parentheses and the reset date; then the computer, the account and the session's messaging name](screenshot-desktop.png)
 
 A wide terminal gets the three rows in full: the whole path, the 10-cell bars, and the computer, account and messaging name together on the last row. This account has no 5-hour window, so only the weekly gauge shows — past 80%, so it's red — with the model's own weekly limit in parentheses. Below the blank spacer row is Claude Code's own footer (here, the permission mode), as in the phone shot.
 
