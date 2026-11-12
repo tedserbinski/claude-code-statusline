@@ -40,13 +40,41 @@ C_THISTLE=$'\033[38;5;182m'
 C_FAINT=$'\033[38;5;240m'     # structure, not content: the · separators and the bars' empty track
 C_RESET=$'\033[0m'
 
+# --- Available width ---
+# Claude Code captures this script's output, so tput/stty can't see the terminal — but it exports
+# COLUMNS with the terminal's width before each run. Rows that don't fit are compacted and then
+# wrapped at their " · " separators (see "Build rows"), so a phone-width terminal shows everything
+# on a few short lines instead of cutting each row off with "…". The margin covers the padding
+# Claude Code puts around the statusline. CLAUDE_SL_WIDTH sets the usable width directly; 0, or no
+# COLUMNS at all (older Claude Code), means "don't fit" and every row stays on one line.
+max_w=0
+if [[ "${CLAUDE_SL_WIDTH-}" =~ ^[0-9]+$ ]]; then
+  max_w=$CLAUDE_SL_WIDTH
+elif [[ "${COLUMNS-}" =~ ^[0-9]+$ ]] && (( COLUMNS > 4 )); then
+  max_w=$(( COLUMNS - 4 ))
+fi
+# Visible width of a string in _w: its length without the color codes. The codes are removed as
+# literal strings, one per color — a single extglob pattern would do it in one pass, but is several
+# times slower, and painfully so on bash 3.2.
+vis_width() {
+  local plain="$1" code
+  for code in "$C_RESET" "$C_FAINT" "$C_GREY" "$C_GREEN" "$C_YELLOW" "$C_RED" \
+              "$C_SKY" "$C_LAVENDER" "$C_THISTLE" "$C_ORANGE" "$C_BLUE"; do
+    plain="${plain//"$code"/}"
+  done
+  _w=${#plain}
+}
+
 # --- Progress bar helpers (set variables, no subshells) ---
-# Sets _bar_result (colored bar) and _pct_color (the same threshold color, for the % text).
+# Sets _bar_result (colored bar, with its leading space) and _pct_color (the same threshold color,
+# for the % text). bar_cells shrinks to 5 and then 0 when row 2 is too wide for the terminal; at 0
+# the bar is dropped and the colored percentage carries the reading.
+bar_cells=10
 build_bar() {
-  local pct=${1:-0} total=${2:-10}
+  local pct=${1:-0} total=${2:-$bar_cells}
   local filled=$(( (pct * total + 50) / 100 ))
   local fill="" track=""
-  # 10 cells = 10% increments. Braille fill: ⣿ (all 8 dots, gap-free) for filled, ⣀ (low baseline
+  # 10 cells = 10% increments (5 cells = 20% on a narrow terminal). Braille fill: ⣿ (all 8 dots, gap-free) for filled, ⣀ (low baseline
   # dots) for the empty track. Swap these two glyphs to restyle (e.g. █/░ solid, ⡇/⡀ thin).
   for ((i=0; i<filled; i++));     do fill="${fill}⣿"; done
   for ((i=filled; i<total; i++)); do track="${track}⣀"; done
@@ -55,7 +83,8 @@ build_bar() {
   (( pct >= 80 )) && _pct_color="$C_RED"
   # Only the used part carries the threshold color; the empty track recedes into dark grey, so
   # a 15% bar reads as a short green stub rather than ten cells of green.
-  _bar_result="${_pct_color}${fill}${C_FAINT}${track}${C_RESET}"
+  _bar_result=""
+  (( total > 0 )) && _bar_result=" ${_pct_color}${fill}${C_FAINT}${track}${C_RESET}"
 }
 
 # Round a possibly-fractional percentage to an int in _pct_int, clamped to 0–100: the API can
@@ -83,7 +112,8 @@ clamp_pct() {
 #   ↻1:10am = resets within a day, shown as the clock time (even when it's after midnight).
 #   ↻Jun 1  = resets further out — shown as month/day (the weekly window). Result in _rate_segment.
 build_rate_segment() {
-  local used_raw="$1" reset_ts="$2" window="$3" glyph="$4"
+  # $5 (optional) is extra text placed after the bar and before the reset time.
+  local used_raw="$1" reset_ts="$2" window="$3" glyph="$4" extra="${5-}"
   clamp_pct "$used_raw"
   local u_int="$_pct_int"
   build_bar "$u_int"
@@ -118,7 +148,7 @@ build_rate_segment() {
       reset=" ${C_GREY}↻${r}${C_RESET}"
     fi
   fi
-  _rate_segment="${_pct_color}${glyph} ${u_int}%${C_RESET} ${_bar_result}${reset}"
+  _rate_segment="${_pct_color}${glyph} ${u_int}%${C_RESET}${_bar_result}${extra:+ $extra}${reset}"
 }
 
 # --- Find jq ---
@@ -223,11 +253,14 @@ fi
 # CLAUDE_SL_ACCOUNT pins the id explicitly (used by the test suite). An unknown account — logged
 # out, or API-key auth, which has no subscription rate limits at all — falls back to the
 # unsuffixed snapshot, which is also what installs that predate this keying already use.
+# The same lookup also yields the account's email address, shown on row 3 so you can see which
+# login a session is on. CLAUDE_SL_ACCOUNT_LABEL pins/overrides what is displayed.
 account="${CLAUDE_SL_ACCOUNT-}"
+account_label=""
 if [ -z "${CLAUDE_SL_ACCOUNT+set}" ]; then
-  # Record format: "<checked_at>\037<account>". The check time lives in the file so its age costs a
-  # builtin read rather than a stat fork. A file from an older version (bare account) reads as
-  # never checked and is refreshed.
+  # Record format: "<checked_at>\037<account>\037<email>". The check time lives in the file so its
+  # age costs a builtin read rather than a stat fork. A file from an older version (bare account)
+  # reads as never checked and is refreshed.
   # Sessions started with different CLAUDE_CONFIG_DIRs are different logins running side by side,
   # so each config dir gets its own record — one shared record would hand profile A's account to
   # profile B for up to 5s, and B would then publish its usage into A's snapshot.
@@ -237,25 +270,28 @@ if [ -z "${CLAUDE_SL_ACCOUNT+set}" ]; then
     (( ${#acct_key} > 100 )) && acct_key="${acct_key: -100}"
     acct_cache="${acct_cache}-${acct_key}"
   fi
-  acct_at="" cached_account=""
-  [ -f "$acct_cache" ] && IFS=$'\037' read -r acct_at cached_account < "$acct_cache" 2>/dev/null
+  acct_at="" cached_account="" cached_label=""
+  [ -f "$acct_cache" ] && IFS=$'\037' read -r acct_at cached_account cached_label < "$acct_cache" 2>/dev/null
   [[ "$acct_at" =~ ^[0-9]+$ ]] || acct_at=0
   if (( now_ts - acct_at >= 5 )); then
     cc_config="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
     if [ -r "$cc_config" ]; then
       # Indexing a missing/null .oauthAccount yields null in jq, so this stays quiet when logged out.
-      account=$("$jq_bin" -r '.oauthAccount.accountUuid // .oauthAccount.emailAddress // ""' "$cc_config" 2>/dev/null)
+      IFS=$'\037' read -r account account_label < <("$jq_bin" -r '
+        .oauthAccount | "\(.accountUuid // .emailAddress // "")\u001f\(.emailAddress // "")"' "$cc_config" 2>/dev/null)
     fi
     # Reduce to a safe filename component — the uuid already is one, an email address isn't.
     account="${account//[^A-Za-z0-9._-]/_}"
     # Temp files are dot-prefixed so they can never be globbed as an account snapshot below, and
     # named by PID ($$) so concurrent sessions never share one — no mktemp fork needed.
     tmp_acct="${cache_dir}/.claude-sl-account.$$"
-    printf '%s\037%s' "$now_ts" "$account" > "$tmp_acct" 2>/dev/null && mv "$tmp_acct" "$acct_cache"
+    printf '%s\037%s\037%s' "$now_ts" "$account" "$account_label" > "$tmp_acct" 2>/dev/null && mv "$tmp_acct" "$acct_cache"
   else
-    account="$cached_account"
+    account="$cached_account"; account_label="$cached_label"
   fi
 fi
+[ -n "${CLAUDE_SL_ACCOUNT_LABEL+set}" ] && account_label="$CLAUDE_SL_ACCOUNT_LABEL"
+account_label="${account_label//[^[:print:]]/}"
 # --- Rate-limit sync across sessions (login/logout, concurrent sessions, limit changes) ---
 # Claude Code holds rate limits in memory per process, filled in only from API response headers,
 # so any one session's payload can be stale: a brand-new session has no rate_limits until its
@@ -407,9 +443,27 @@ usage_ttl="${CLAUDE_SL_USAGE_TTL-180}"
 [[ "$usage_ttl" =~ ^[0-9]+$ ]] || usage_ttl=180
 usage_file="${cache_dir}/claude-sl-usage"
 [ -n "$account" ] && usage_file="${usage_file}-${account}"
-api_5pct="" api_5rst="" api_7pct="" api_7rst="" api_at=""
+# The endpoint also reports what the statusline payload doesn't carry at all: per-model weekly
+# limits ("weekly_scoped" — e.g. a Fable-only allowance that can run out before the all-models
+# one). They trail the record as "<model>=<used%>=<reset>;…", and the one for the model this
+# session is running gets its own gauge on row 2.
+api_5pct="" api_5rst="" api_7pct="" api_7rst="" api_at="" api_scoped=""
 if [ -f "$usage_file" ]; then
-  IFS=$'\037' read -r api_5pct api_5rst api_7pct api_7rst api_at < "$usage_file" 2>/dev/null
+  IFS=$'\037' read -r api_5pct api_5rst api_7pct api_7rst api_at api_scoped < "$usage_file" 2>/dev/null
+fi
+[[ "$api_at" =~ ^[0-9]+$ ]] || api_at=0
+model_limit_name="" model_limit_pct="" model_limit_reset=0
+if [ -n "$api_scoped" ] && [ -n "$model" ]; then
+  IFS=';' read -r -a scoped_limits <<< "$api_scoped"
+  for entry in "${scoped_limits[@]}"; do
+    IFS='=' read -r s_name s_pct s_reset <<< "$entry"
+    [ -n "$s_name" ] && [[ "$s_pct" =~ ^[0-9] ]] && [[ "$model" == *"$s_name"* ]] || continue
+    [[ "$s_reset" =~ ^[0-9]+$ ]] || s_reset=0
+    # A limit whose reset has passed has rolled over; its old reading means nothing now.
+    (( s_reset > 0 && s_reset <= now_ts )) && continue
+    model_limit_name="$s_name"; model_limit_pct="$s_pct"; model_limit_reset="$s_reset"
+    break
+  done
 fi
 pick_window "$five_hour_pct" "$five_hour_reset" "$five_hour_at" "$api_5pct" "$api_5rst" "$api_at"
 five_hour_pct="$_w_pct"; five_hour_reset="$_w_reset"; five_hour_at="$_w_seen"
@@ -446,7 +500,8 @@ read_oauth_token() {
   [ -n "$_token" ]
 }
 
-# Fetch once, in the background. Writes "<5h%>\037<5h reset>\037<7d%>\037<7d reset>\037<fetched_at>"
+# Fetch once, in the background. Writes
+# "<5h%>\037<5h reset>\037<7d%>\037<7d reset>\037<fetched_at>\037<per-model limits>"
 # to $usage_file on success, or "<http code>\037<time>" to $usage_file.err on failure.
 fetch_usage_in_background() {
   local lock="${usage_file}.lock"
@@ -486,12 +541,22 @@ fetch_usage_in_background() {
         | ($m.b + "Z" | fromdateiso8601) + (if (($m.f // "0") | tonumber) > 0 then 1 else 0 end)
       ) catch 0;
       [ (.five_hour.utilization // ""), (.five_hour.resets_at | epoch),
-        (.seven_day.utilization // ""), (.seven_day.resets_at | epoch) ]
+        (.seven_day.utilization // ""), (.seven_day.resets_at | epoch),
+        ([ (try .limits[] catch empty)
+           | select(type == "object" and .kind == "weekly_scoped" and (.percent | type) == "number")
+           | ((try .scope.model.display_name catch null) // "" | tostring | gsub("[^A-Za-z0-9 .-]"; "")) as $name
+           | select($name != "")
+           | "\($name)=\(.percent)=\(.resets_at | epoch)" ] | join(";")) ]
       | map(tostring) | join("\u001f")' 2>/dev/null)
     local fetched_at; fetched_at=${EPOCHSECONDS:-$(date +%s)}
-    if { [ "$code" = "200" ] || [ "$code" = "000" ]; } && [[ "$parsed" =~ ^[0-9] ]]; then
+    # Either window may be null — an account can have a weekly limit and no 5-hour window at all —
+    # so the answer is good when at least one of them carries a number.
+    local got_5pct got_5rst got_7pct got_7rst got_scoped
+    IFS=$'\037' read -r got_5pct got_5rst got_7pct got_7rst got_scoped <<< "$parsed"
+    if { [ "$code" = "200" ] || [ "$code" = "000" ]; } && { [[ "$got_5pct" =~ ^[0-9] ]] || [[ "$got_7pct" =~ ^[0-9] ]]; }; then
       local tmp="${cache_dir}/.claude-sl-usage.$$"
-      printf '%s\037%s' "$parsed" "$fetched_at" > "$tmp" 2>/dev/null && mv "$tmp" "$usage_file"
+      printf '%s\037%s\037%s\037%s\037%s\037%s' "$got_5pct" "$got_5rst" "$got_7pct" "$got_7rst" \
+        "$fetched_at" "$got_scoped" > "$tmp" 2>/dev/null && mv "$tmp" "$usage_file"
       rm -f "${usage_file}.err"
     else
       printf '%s\037%s' "${code:-000}" "$fetched_at" > "${usage_file}.err" 2>/dev/null
@@ -512,7 +577,14 @@ if (( usage_ttl > 0 )) && [ -n "$account" ] && [ -n "$cc_version" ]; then
     # A missing/expired token clears itself on Claude Code's next API call: retry after a minute.
     [ "$err_code" = "notoken" ] && backoff=60
   fi
-  if (( now_ts - newest_at >= usage_ttl )) && (( now_ts - err_at >= backoff )); then
+  # Per-model limits come from nowhere else, so headers can't keep them fresh: an account that
+  # has any is re-asked every 5 minutes even while active (never faster — the endpoint 429s).
+  scoped_due=0
+  if [ -n "$api_scoped" ]; then
+    scoped_ttl=$(( usage_ttl > 300 ? usage_ttl : 300 ))
+    (( now_ts - api_at >= scoped_ttl )) && scoped_due=1
+  fi
+  if { (( now_ts - newest_at >= usage_ttl )) || (( scoped_due )); } && (( now_ts - err_at >= backoff )); then
     fetch_usage_in_background
   fi
 fi
@@ -807,126 +879,231 @@ if (( now_ts - pruned_at >= 86400 )); then
 fi
 
 # --- Build rows ---
-# Two rows, each read left to right from what you check most to what you only need now and then:
-#   row 1 — what and where: model + effort/fast/style · dir ↳ worktree ⎇ branch · lines changed
-#   row 2 — gauges, then reference: context · 5-hour · weekly · messaging name · pending update
-# Row 2 always opens with the context gauge, so the bars sit in the same columns whatever the model
-# or path. A single long row got cut off by Claude Code in deep directories, and the script can't
-# learn the terminal width to adapt.
+# Three rows, one question each:
+#   row 1 — where:        dir ↳ worktree ⎇ branch · lines changed
+#   row 2 — how it runs:  model + effort/fast/style · context · 5-hour · weekly · pending update
+#   row 3 — who:          computer · logged-in account · messaging name
+# On a wide terminal that is exactly three lines. When a row is wider than the terminal (a phone,
+# a narrow split) it first sheds what it can spare — row 1 abbreviates the path to "…/parent/folder", then "…/folder",
+# row 2 halves its bars, drops them (the colored percentages stay), then shortens its labels — and whatever still doesn't fit wraps
+# onto a continuation line at a " · " boundary. Nothing is ever cut off mid-segment.
 session_row=()
 usage_row=()
+identity_row=()
 
-# Model, with effort, fast mode and a non-default output style beside it in grey
-# ("◆ Opus 5.5 medium fast ☰Learning") — all describe how Claude is running
-model_mods=""
-[ -n "$effort" ] && model_mods="$effort"
-[ -n "$fast_mode" ] && model_mods="${model_mods:+$model_mods }fast"
-if [ -n "$output_style" ] && [ "$output_style" != "default" ]; then
-  model_mods="${model_mods:+$model_mods }☰${output_style}"
-fi
-if [ -n "$model" ]; then
-  session_row+=("${C_ORANGE}◆ ${model}${C_RESET}${model_mods:+ ${C_GREY}${model_mods}${C_RESET}}")
-elif [ -n "$model_mods" ]; then
-  session_row+=("${C_GREY}${model_mods}${C_RESET}")
+# Total visible width of a row's segments once joined with " · ", in _row_w.
+row_width() {
+  local seg
+  _row_w=0
+  for seg in "$@"; do
+    vis_width "$seg"
+    _row_w=$(( _row_w + _w + (_row_w > 0 ? 3 : 0) ))
+  done
+}
+
+# --- Row 1: where ---
+# Directory + worktree label + git branch are ONE segment, joined by plain spaces (no " · "
+# between them — they're a single "where am I" group); lines changed is the second segment.
+# $1 abbreviates the directory: "parent" → "…/<parent>/<folder>", "short" → "…/<folder>".
+build_session_row() {
+  session_row=()
+  local location="" display_dir=""
+  if [ -n "$cwd" ]; then
+    # Collapse a leading $HOME to ~. Done as prefix-strip (#) + quoted "~" rather than a /#/
+    # pattern substitution: bash 5.2+ tilde-expands a ~ in a substitution's replacement string
+    # (turning it back into $HOME → no-op, full path leaks), while bash 3.2 leaves a \~ literal.
+    # ${cwd#$HOME} behaves identically across versions, and ~ inside double quotes is never expanded.
+    if [ "$cwd" = "$HOME" ] || [ "${cwd#"$HOME"/}" != "$cwd" ]; then
+      display_dir="~${cwd#"$HOME"}"
+    else
+      display_dir="$cwd"
+    fi
+    # Worktrees live at <repo>/.claude/worktrees/<name>. Collapse that whole tail back to the
+    # repo root, then tag on a "↳ <name>" label so the worktree is named without the long path.
+    display_dir="${display_dir%%/.claude/worktrees/*}"
+    local folder="${display_dir##*/}"
+    # Abbreviate only when it actually removes something: "~/repo" and "/repo" stay as they are.
+    local head="${display_dir%/*}"       # everything before the folder
+    local parent="${head##*/}"           # the folder's parent ("~" or "" at the top)
+    if [ "${1-}" = "parent" ] && [ -n "$folder" ] && [ -n "$parent" ] && [ "$parent" != "~" ] \
+       && [ "${head%/*}" != "$head" ] && [ -n "${head%/*}" ]; then
+      display_dir="…/${parent}/${folder}"
+    elif [ "${1-}" = "short" ] && [ -n "$folder" ] && [ -n "$head" ] && [ "$head" != "~" ]; then
+      display_dir="…/${folder}"
+    fi
+    location="${C_SKY}${display_dir}${C_RESET}"
+    # Skip the label when it would just repeat the folder name (~/…/worktree02 ↳ worktree02); it
+    # stays when the folder shows something else, e.g. the repo root of a .claude/worktrees/ checkout.
+    if [ -n "$git_worktree" ] && [ "$git_worktree" != "$folder" ]; then
+      location="${location} ${C_THISTLE}↳ ${git_worktree}${C_RESET}"
+    fi
+  fi
+  [ -n "$git_branch" ] && location="${location:+$location }${C_LAVENDER}⎇ ${git_branch}${C_RESET}"
+  [ -n "$location" ] && session_row+=("$location")
+  # Lines changed (real git diff vs the branch's fork point — committed + uncommitted).
+  # Hidden on a clean tree so +0/-0 never adds noise.
+  if [ "${git_added:-0}" != "0" ] || [ "${git_removed:-0}" != "0" ]; then
+    session_row+=("${C_GREEN}+${git_added:-0}${C_RESET}/${C_RED}-${git_removed:-0}${C_RESET}")
+  fi
+}
+build_session_row
+if (( max_w > 0 && ${#session_row[@]} > 0 )); then
+  # Too wide: keep one parent folder for context ("…/Github/repo") if the whole row then fits;
+  # otherwise show the folder alone ("…/repo"), which keeps the branch and lines-changed on the
+  # same line rather than wrapping them.
+  for shorter in parent short; do
+    row_width "${session_row[@]}"
+    (( _row_w > max_w )) || break
+    build_session_row "$shorter"
+  done
 fi
 
-# Location: directory + worktree label + git branch as ONE segment, joined by plain spaces
-# (no " · " between them — they're a single "where am I" group). The join loop only inserts
-# " · " *between* parts, so keeping these in one array slot suppresses the dot here while
-# preserving it before the segments that follow.
-location=""
-if [ -n "$cwd" ]; then
-  # Collapse a leading $HOME to ~. Done as prefix-strip (#) + quoted "~" rather than a /#/
-  # pattern substitution: bash 5.2+ tilde-expands a ~ in a substitution's replacement string
-  # (turning it back into $HOME → no-op, full path leaks), while bash 3.2 leaves a \~ literal.
-  # ${cwd#$HOME} behaves identically across versions, and ~ inside double quotes is never expanded.
-  if [ "$cwd" = "$HOME" ] || [ "${cwd#"$HOME"/}" != "$cwd" ]; then
-    display_dir="~${cwd#"$HOME"}"
+# --- Row 2: how it runs ---
+# compact_labels=1 — the last resort on a narrow terminal, after the bars are gone — switches to
+# short forms: the model family as Fab/Son/Hai (Opus is already four letters), effort as
+# lo/med/hi/xhi, and a pending update as a bare "↑" without the version.
+compact_labels=0
+short_model() {   # $1 = a model name; result in _short
+  _short="${1/Fable/Fab}"; _short="${_short/Sonnet/Son}"; _short="${_short/Haiku/Hai}"
+}
+build_usage_row() {
+  usage_row=()
+  # Model, with effort, fast mode and a non-default output style beside it in grey
+  # ("◆ Opus 5.5 medium fast ☰Learning") — all describe how Claude is running.
+  local model_mods="" effort_label="$effort" model_label="$model" limit_label="$model_limit_name"
+  if (( compact_labels )); then
+    short_model "$model"; model_label="$_short"
+    short_model "$model_limit_name"; limit_label="$_short"
+    case "$effort" in
+      low) effort_label="lo" ;; medium) effort_label="med" ;; high) effort_label="hi" ;; xhigh) effort_label="xhi" ;;
+    esac
+  fi
+  [ -n "$effort_label" ] && model_mods="$effort_label"
+  [ -n "$fast_mode" ] && model_mods="${model_mods:+$model_mods }fast"
+  if [ -n "$output_style" ] && [ "$output_style" != "default" ]; then
+    model_mods="${model_mods:+$model_mods }☰${output_style}"
+  fi
+  if [ -n "$model" ]; then
+    usage_row+=("${C_ORANGE}◆ ${model_label}${C_RESET}${model_mods:+ ${C_GREY}${model_mods}${C_RESET}}")
+  elif [ -n "$model_mods" ]; then
+    usage_row+=("${C_GREY}${model_mods}${C_RESET}")
+  fi
+
+  # Context bar
+  if [ -n "$ctx_pct" ]; then
+    # Same clamp as the rate windows: a full context can report a hair over 100 ("101%").
+    clamp_pct "$ctx_pct"
+    build_bar "$_pct_int"
+    usage_row+=("${_pct_color}⛁ ${_pct_int}%${C_RESET}${_bar_result}")
   else
-    display_dir="$cwd"
+    usage_row+=("${C_GREY}⛁ --${C_RESET}")
   fi
-  # Worktrees live at <repo>/.claude/worktrees/<name>. Collapse that whole tail back to the
-  # repo root, then tag on a "↳ <name>" label so the worktree is named without the long path.
-  display_dir="${display_dir%%/.claude/worktrees/*}"
-  location="${C_SKY}${display_dir}${C_RESET}"
-  # Skip the label when it would just repeat the folder name (~/…/worktree02 ↳ worktree02); it
-  # stays when the folder shows something else, e.g. the repo root of a .claude/worktrees/ checkout.
-  if [ -n "$git_worktree" ] && [ "$git_worktree" != "${display_dir##*/}" ]; then
-    location="${location} ${C_THISTLE}↳ ${git_worktree}${C_RESET}"
+
+  # Rate limit bars — 5-hour (⏱) session window and 7-day (⧖) weekly window.
+  # Each renders identically via build_rate_segment; both windows degrade independently
+  # (the docs note either may be absent), so the weekly segment is simply skipped when missing.
+  if [ -n "$five_hour_pct" ]; then
+    build_rate_segment "$five_hour_pct" "$five_hour_reset" 18000 "⏱"
+    usage_row+=("$_rate_segment")
+  elif [ -z "$seven_day_pct" ]; then
+    # Nothing known yet about either window: a placeholder until the first numbers arrive. When
+    # the weekly window IS known and the 5-hour one isn't, the account simply has no 5-hour window
+    # right now (the usage endpoint reports it as null), so the segment is left out rather than
+    # shown as a "--" that looks like missing data.
+    usage_row+=("${C_GREY}⏱ --${C_RESET}")
   fi
-fi
-[ -n "$git_branch" ] && location="${location:+$location }${C_LAVENDER}⎇ ${git_branch}${C_RESET}"
-if [ -n "$location" ]; then
-  session_row+=("$location")
+  # This model's own weekly limit, when the account has one, rides inside the weekly segment in
+  # parentheses — "⧖ 81% ⣿⣿⣿⣿⣿⣿⣿⣿⣀⣀ (Fable 89%) ↻Nov 16" — in its own threshold color. The two
+  # normally reset together, so the one ↻ covers both; if the model's reset differs it is shown
+  # inside the parentheses. With no all-models window to attach to, it stands as its own segment.
+  local limit_note=""
+  if [ -n "$model_limit_pct" ] && [ -n "$seven_day_pct" ]; then
+    local drift=$(( model_limit_reset - seven_day_reset )) limit_reset=""
+    if (( model_limit_reset > 0 )) && (( drift <= -60 || drift >= 60 )); then
+      local saved_cells=$bar_cells
+      bar_cells=0; build_rate_segment "$model_limit_pct" "$model_limit_reset" 604800 "x"; bar_cells=$saved_cells
+      limit_reset="${_rate_segment#*%"$C_RESET"}"      # just the " ↻…" part, if any
+    fi
+    clamp_pct "$model_limit_pct"; build_bar "$_pct_int" 0
+    limit_note="${C_GREY}(${_pct_color}${limit_label} ${_pct_int}%${C_RESET}${limit_reset}${C_GREY})${C_RESET}"
+  fi
+  if [ -n "$seven_day_pct" ]; then
+    build_rate_segment "$seven_day_pct" "$seven_day_reset" 604800 "⧖" "$limit_note"
+    usage_row+=("$_rate_segment")
+  elif [ -n "$model_limit_pct" ]; then
+    build_rate_segment "$model_limit_pct" "$model_limit_reset" 604800 "⧖ ${limit_label}"
+    usage_row+=("$_rate_segment")
+  fi
+
+  # Pending update: shown only when the installed Claude Code differs from the one running, as the
+  # version a restart will bring ("v2.1.297 ↑"). The running version is hidden — it only matters
+  # when it's out of date. ↑ rather than ↻, which already means "resets at" on this row. It ends the
+  # row, as the least-needed item.
+  if [ -n "$update_available" ]; then
+    if (( compact_labels )); then
+      usage_row+=("${C_GREEN}↑${C_RESET}")
+    else
+      usage_row+=("${C_GREEN}v${installed_version} ↑${C_RESET}")
+    fi
+  fi
+}
+build_usage_row
+if (( max_w > 0 )); then
+  # Too wide: halve the bars (5 cells, 20% each), then drop them, then shorten the labels.
+  for narrower in 5 0 labels; do
+    row_width "${usage_row[@]}"
+    (( _row_w > max_w )) || break
+    if [ "$narrower" = labels ]; then compact_labels=1; else bar_cells=$narrower; fi
+    build_usage_row
+  done
 fi
 
-# Lines changed (real git diff vs the branch's fork point — committed + uncommitted).
-# Hidden on a clean tree so +0/-0 never adds noise.
-if [ "${git_added:-0}" != "0" ] || [ "${git_removed:-0}" != "0" ]; then
-  session_row+=("${C_GREEN}+${git_added:-0}${C_RESET}/${C_RED}-${git_removed:-0}${C_RESET}")
+# --- Row 3: who ---
+# Computer: bash's own $HOSTNAME (no fork), minus the domain — "Teds-Mac-Studio.local" →
+# "Teds-Mac-Studio". It tells sessions on different machines (ssh, remote control) apart.
+# CLAUDE_SL_HOST overrides it (a friendlier name; empty hides it). Account: the logged-in email
+# from the account lookup above; absent with API-key auth. CLAUDE_SL_IDENTITY=0 hides both.
+if [ "${CLAUDE_SL_IDENTITY-1}" != "0" ]; then
+  host="${CLAUDE_SL_HOST-${HOSTNAME%%.*}}"
+  host="${host//[^[:print:]]/}"
+  [ -n "$host" ] && identity_row+=("${C_GREY}⌂ ${host}${C_RESET}")
+  [ -n "$account_label" ] && identity_row+=("${C_GREY}${account_label}${C_RESET}")
 fi
-
-# Context bar
-if [ -n "$ctx_pct" ]; then
-  # Same clamp as the rate windows: a full context can report a hair over 100 ("101%").
-  clamp_pct "$ctx_pct"
-  build_bar "$_pct_int"
-  usage_row+=("${_pct_color}⛁ ${_pct_int}%${C_RESET} ${_bar_result}")
-else
-  usage_row+=("${C_GREY}⛁ --${C_RESET}")
-fi
-
-# Rate limit bars — 5-hour (⏱) session window and 7-day (⧖) weekly window.
-# Each renders identically via build_rate_segment; both windows degrade independently
-# (the docs note either may be absent), so the weekly segment is simply skipped when missing.
-if [ -n "$five_hour_pct" ]; then
-  build_rate_segment "$five_hour_pct" "$five_hour_reset" 18000 "⏱"
-  usage_row+=("$_rate_segment")
-else
-  usage_row+=("${C_GREY}⏱ --${C_RESET}")
-fi
-if [ -n "$seven_day_pct" ]; then
-  build_rate_segment "$seven_day_pct" "$seven_day_reset" 604800 "⧖"
-  usage_row+=("$_rate_segment")
-fi
-
-# Session: the messaging name other sessions use to reach this one — reference info, just before
-# any pending update (which ends the row, as the least-needed item and the first a narrow terminal
-# cuts).
-# Shown as @name, since it's an address. Falls back to #<first 8 chars of the session UUID> on
-# versions that don't write one — # marks an id you can't message.
+# The messaging name other sessions use to reach this one, shown as @name since it's an address.
+# Falls back to #<first 8 chars of the session UUID> on versions that don't write one — # marks an
+# id you can't message.
 if [ -n "$messaging_name" ]; then
-  usage_row+=("${C_BLUE}@${messaging_name}${C_RESET}")
+  identity_row+=("${C_BLUE}@${messaging_name}${C_RESET}")
 elif [ -n "$session_id" ]; then
-  usage_row+=("${C_BLUE}#${session_id:0:8}${C_RESET}")
-fi
-
-# Pending update: shown only when the installed Claude Code differs from the one running, as the
-# version a restart will bring ("v2.1.297 ↑"). The running version is hidden — it only matters
-# when it's out of date. ↑ rather than ↻, which already means "resets at" on this row.
-if [ -n "$update_available" ]; then
-  usage_row+=("${C_GREEN}v${installed_version} ↑${C_RESET}")
+  identity_row+=("${C_BLUE}#${session_id:0:8}${C_RESET}")
 fi
 
 # --- Join and output ---
-# Each row is joined with " · "; rows are separated by a newline (Claude Code renders one status
-# row per line). Every row starts with a reset, which overrides Claude Code's ambient dim styling
-# (pattern from ccstatusline), and the output never ends in a bare newline.
-join_parts() {
-  local out="$1"; shift
-  local part
-  for part in "$@"; do out="${out} ${C_FAINT}·${C_RESET} ${part}"; done
-  _joined="$out"
-}
+# Each row's segments are joined with " · " and, when the width is known, wrapped onto a
+# continuation line wherever the next segment wouldn't fit. Lines are separated by a newline
+# (Claude Code renders one status row per line). Every line starts with a reset, which overrides
+# Claude Code's ambient dim styling (pattern from ccstatusline), and the output never ends in a
+# bare newline.
 rows=()
-if (( ${#session_row[@]} > 0 )); then
-  join_parts "${session_row[@]}"
-  rows+=("$_joined")
-fi
-# usage_row always holds at least the context and 5-hour segments
-join_parts "${usage_row[@]}"
-rows+=("$_joined")
-# A spacer row after row 2 separates the statusline from Claude Code's own footer below it (mode,
+add_row() {
+  local line="" line_w=0 seg
+  for seg in "$@"; do
+    _w=0; (( max_w > 0 )) && vis_width "$seg"
+    if [ -z "$line" ]; then
+      line="$seg"; line_w=$_w
+    elif (( max_w > 0 && line_w + 3 + _w > max_w )); then
+      rows+=("$line"); line="$seg"; line_w=$_w
+    else
+      line="${line} ${C_FAINT}·${C_RESET} ${seg}"; line_w=$(( line_w + 3 + _w ))
+    fi
+  done
+  [ -n "$line" ] && rows+=("$line")
+}
+(( ${#session_row[@]} > 0 )) && add_row "${session_row[@]}"
+# usage_row always holds at least the context segment
+add_row "${usage_row[@]}"
+(( ${#identity_row[@]} > 0 )) && add_row "${identity_row[@]}"
+# A spacer row after the last row separates the statusline from Claude Code's own footer below it (mode,
 # shells, agents, the PR link, workflow progress). It's a lone space rather than a bare trailing
 # newline, which Claude Code may count or trim unpredictably. CLAUDE_SL_SPACER=0 turns it off.
 [ "${CLAUDE_SL_SPACER-1}" != "0" ] && rows+=(" ")

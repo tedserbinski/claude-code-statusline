@@ -23,6 +23,13 @@ export CLAUDE_SL_USAGE_TTL
 # real ~/.local/bin/claude symlink. Scenarios that send "version":"2.1.0" are up to date.
 CLAUDE_SL_INSTALLED_VERSION="2.1.0"
 export CLAUDE_SL_INSTALLED_VERSION
+# Row 3 shows the computer name; pin it so expectations don't depend on the machine running the suite.
+CLAUDE_SL_HOST="test-host"
+export CLAUDE_SL_HOST
+# Claude Code exports COLUMNS and the script fits its rows to it; unset it (and any width pin) so
+# layout expectations don't depend on the terminal the suite runs in. The width scenarios set
+# CLAUDE_SL_WIDTH themselves.
+unset COLUMNS CLAUDE_SL_WIDTH
 RATE_CACHE="$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-a"
 USAGE_CACHE="$CLAUDE_SL_CACHE_DIR/claude-sl-usage-acct-a"
 RATE_CACHE_B="$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-b"
@@ -50,13 +57,13 @@ run_test() {
     errors="${errors}\n    EXIT CODE: $exit_code (expected 0)"
   fi
 
-  # Test 2: at most 3 rows of output (row 1 + row 2 + the spacer row), no trailing newline
+  # Test 2: at most 4 rows of output (rows 1–3 + the spacer row), no trailing newline
   local line_count
   line_count=$(printf '%s' "$stdout" | wc -l | tr -d ' ')
   # wc -l counts newlines; $( ) strips a trailing one, so check the raw tail separately.
-  # Three rows with no trailing newline = 2.
-  if [ "$line_count" -gt 2 ]; then
-    errors="${errors}\n    LINE COUNT: $((line_count + 1)) rows (expected ≤ 3)"
+  # Four rows with no trailing newline = 3.
+  if [ "$line_count" -gt 3 ]; then
+    errors="${errors}\n    LINE COUNT: $((line_count + 1)) rows (expected ≤ 4)"
   fi
   if [ "$(echo "$json" | bash "$SCRIPT" 2>/dev/null | tail -c 1 | od -An -c | tr -d ' ')" = '\n' ]; then
     errors="${errors}\n    TRAILING NEWLINE: present"
@@ -921,20 +928,22 @@ TOTAL=$((TOTAL + 1))
 out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"session_id":"abc12345-xxxx","effort":"medium","output_style":"Learning","context_window":{"used_percentage":10},"rate_limits":{"five_hour":{"used_percentage":15}},"version":"2.1.0"}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 row1=$(printf '%s\n' "$out" | sed -n 1p)
 row2=$(printf '%s\n' "$out" | sed -n 2p)
-if [ "$row1" = "◆ Opus 5.5 medium ☰Learning · /tmp" ] \
-   && [[ "$row2" == "⛁ 10% "*" · ⏱ 15% "*" · #abc12345" ]] \
+row3=$(printf '%s\n' "$out" | sed -n 3p)
+if [ "$row1" = "/tmp" ] \
+   && [[ "$row2" == "◆ Opus 5.5 medium ☰Learning · ⛁ 10% "*" · ⏱ 15% "* ]] && [[ "$row2" != *"2.1.0"* ]] \
+   && [ "$row3" = "⌂ test-host · #abc12345" ] \
    && [[ "$out" != *"effort:"* ]]; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Row 1: model + effort + style · dir; row 2: gauges · session (version hidden when current)\n"
+  printf "  \033[32m✓\033[0m Row 1: dir; row 2: model + effort + style · gauges (version hidden when current); row 3: host · session\n"
 else
   FAIL=$((FAIL + 1))
-  printf "  \033[31m✗\033[0m Two-row layout wrong — output: %s\n" "$out"
+  printf "  \033[31m✗\033[0m Three-row layout wrong — output: %s\n" "$out"
 fi
 
 # --- Scenario 16b2: Pending update shows the version a restart brings, not the running one ---
 TOTAL=$((TOTAL + 1))
 out=$(echo '{"model":{"display_name":"x"},"version":"2.1.0"}' | CLAUDE_SL_INSTALLED_VERSION="2.1.5" bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
-if [[ "${out%$'\n' }" == *" · v2.1.5 ↑" ]] && [[ "$out" != *"2.1.0"* ]]; then
+if [[ "$out" == *" · v2.1.5 ↑"$'\n'"⌂ "* ]] && [[ "$out" != *"2.1.0"* ]]; then
   PASS=$((PASS + 1))
   printf "  \033[32m✓\033[0m Update pending: shows v2.1.5 ↑, hides the running 2.1.0\n"
 else
@@ -961,7 +970,7 @@ fi
 # --- Scenario 16d: Full directory names are kept (only $HOME collapses to ~) ---
 TOTAL=$((TOTAL + 1))
 out=$(echo "{\"workspace\":{\"current_dir\":\"$HOME/Projects/Github/my-repo\"},\"model\":{\"display_name\":\"x\"}}" | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
-if [[ "$out" == "◆ x · ~/Projects/Github/my-repo"* ]]; then
+if [[ "$out" == "~/Projects/Github/my-repo"$'\n'"◆ x · "* ]]; then
   PASS=$((PASS + 1))
   printf "  \033[32m✓\033[0m Path shown in full: ~/Projects/Github/my-repo\n"
 else
@@ -973,7 +982,7 @@ fi
 TOTAL=$((TOTAL + 1))
 out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"effort":{"level":"high"},"fast_mode":true,"pr":{"number":42,"url":"https://x/42","review_state":"APPROVED"}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 plain=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 5.5"},"fast_mode":false}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
-if [[ "$out" == "◆ Opus 5.5 high fast · /tmp"$'\n'* ]] && [[ "$out" != *"42"* ]] && [[ "$plain" == "◆ Opus 5.5 · /tmp"$'\n'* ]]; then
+if [[ "$out" == "/tmp"$'\n'"◆ Opus 5.5 high fast · ⛁"* ]] && [[ "$out" != *"42"* ]] && [[ "$plain" == "/tmp"$'\n'"◆ Opus 5.5 · ⛁"* ]]; then
   PASS=$((PASS + 1))
   printf "  \033[32m✓\033[0m Fast mode beside effort; PR not duplicated (Claude Code links it)\n"
 else
@@ -985,8 +994,8 @@ fi
 TOTAL=$((TOTAL + 1))
 sp_on=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"x"}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 sp_off=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"x"}}' | CLAUDE_SL_SPACER=0 bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
-if [ "$(printf '%s\n' "$sp_on" | sed -n 3p)" = " " ] && [ "$(printf '%s' "$sp_on" | wc -l | tr -d ' ')" = 2 ] \
-   && [ "$(printf '%s' "$sp_off" | wc -l | tr -d ' ')" = 1 ]; then
+if [ "$(printf '%s\n' "$sp_on" | sed -n 4p)" = " " ] && [ "$(printf '%s' "$sp_on" | wc -l | tr -d ' ')" = 3 ] \
+   && [ "$(printf '%s' "$sp_off" | wc -l | tr -d ' ')" = 2 ]; then
   PASS=$((PASS + 1))
   printf "  \033[32m✓\033[0m Spacer row present by default, off with CLAUDE_SL_SPACER=0\n"
 else
@@ -1015,14 +1024,14 @@ rm -f "$TMPFILE.ref"
 TOTAL=$((TOTAL + 1))
 acct_dir=$(mktemp -d)
 acct_rec="$CLAUDE_SL_CACHE_DIR/claude-sl-account-${acct_dir//[^A-Za-z0-9._-]/_}"
-printf '{"oauthAccount":{"accountUuid":"acct-new"}}' > "$acct_dir/.claude.json"
+printf '{"oauthAccount":{"accountUuid":"acct-new","emailAddress":"new@example.com"}}' > "$acct_dir/.claude.json"
 printf 'acct-old' > "$acct_rec"
 echo "{\"model\":{\"display_name\":\"x\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":33,\"resets_at\":$(( $(date +%s) + 3600 ))}}}" \
   | env -u CLAUDE_SL_ACCOUNT CLAUDE_CONFIG_DIR="$acct_dir" bash "$SCRIPT" >/dev/null 2>&1
 acct_line=$(tr '\037' ' ' < "$acct_rec")
-if [[ "$acct_line" =~ ^[0-9]+\ acct-new$ ]] && [ -f "$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-new" ]; then
+if [[ "$acct_line" =~ ^[0-9]+\ acct-new\ new@example\.com$ ]] && [ -f "$CLAUDE_SL_CACHE_DIR/claude-sl-rate-acct-new" ]; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Legacy account cache refreshed into <checked_at><sep><account>\n"
+  printf "  \033[32m✓\033[0m Legacy account cache refreshed into <checked_at><sep><account><sep><email>\n"
 else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Account cache not refreshed — got: %s\n" "$acct_line"
@@ -1050,7 +1059,7 @@ rm -rf "$prune_dir"
 # A folder named "bs\cut" used to cut the whole statusline off at the \c (printf %b on content).
 TOTAL=$((TOTAL + 1))
 out=$(printf '%s' '{"workspace":{"current_dir":"/tmp/bs\\cut/x\\n"},"model":{"display_name":"Claude Opus 5.5"},"output_style":"a\\tb","context_window":{"used_percentage":10}}' | bash "$SCRIPT" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
-if [[ "$out" == '◆ Opus 5.5 ☰a\tb · /tmp/bs\cut/x\n'$'\n''⛁ 10% '* ]]; then
+if [[ "$out" == '/tmp/bs\cut/x\n'$'\n''◆ Opus 5.5 ☰a\tb · ⛁ 10% '* ]]; then
   PASS=$((PASS + 1))
   printf "  \033[32m✓\033[0m Backslashes in paths and names render literally\n"
 else
@@ -1185,6 +1194,80 @@ check "No token for this profile → short backoff marker, default profile's tok
 rm -rf "$prof_a" "$prof_b" "$CLAUDE_SL_CACHE_DIR"/claude-sl-account-* "$CLAUDE_SL_CACHE_DIR"/claude-sl-rate-acct-p? \
   "$CLAUDE_SL_CACHE_DIR"/claude-sl-usage-acct-pa* "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
 
+# P13: row 3 — computer, logged-in account (read from .claude.json), messaging name / session id
+id_dir=$(mktemp -d)
+printf '{"oauthAccount":{"accountUuid":"acct-id","emailAddress":"dev@example.com"}}' > "$id_dir/.claude.json"
+strip() { sed 's/\x1b\[[0-9;]*m//g'; }
+out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"x"},"session_id":"id123456-zz"}' \
+  | env -u CLAUDE_SL_ACCOUNT CLAUDE_CONFIG_DIR="$id_dir" bash "$SCRIPT" 2>/dev/null | strip)
+check "Row 3: computer · account email · session" "$([ "$(printf '%s\n' "$out" | sed -n 3p)" = "⌂ test-host · dev@example.com · #id123456" ] && echo ok)" "$out"
+# ...served from the 5s account cache on the next tick, with the default host being the short hostname
+out=$(echo '{"workspace":{"current_dir":"/tmp"},"session_id":"id123456-zz"}' \
+  | env -u CLAUDE_SL_ACCOUNT -u CLAUDE_SL_HOST CLAUDE_CONFIG_DIR="$id_dir" HOSTNAME="box-7.corp.example.com" bash "$SCRIPT" 2>/dev/null | strip)
+check "Row 3: cached account, hostname trimmed to its first label" "$([ "$(printf '%s\n' "$out" | sed -n 3p)" = "⌂ box-7 · dev@example.com · #id123456" ] && echo ok)" "$out"
+# CLAUDE_SL_IDENTITY=0 hides computer and account; the session stays; with nothing left the row is dropped
+out=$(echo '{"workspace":{"current_dir":"/tmp"},"session_id":"id123456-zz"}' \
+  | env -u CLAUDE_SL_ACCOUNT CLAUDE_SL_IDENTITY=0 CLAUDE_CONFIG_DIR="$id_dir" bash "$SCRIPT" 2>/dev/null | strip)
+bare=$(echo '{"workspace":{"current_dir":"/tmp"}}' | CLAUDE_SL_IDENTITY=0 bash "$SCRIPT" 2>/dev/null | strip)
+check "CLAUDE_SL_IDENTITY=0 hides computer and account" "$([ "$(printf '%s\n' "$out" | sed -n 3p)" = "#id123456" ] && [ "$(printf '%s' "$bare" | wc -l | tr -d ' ')" = 2 ] && echo ok)" "$out // $bare"
+rm -rf "$id_dir" "$CLAUDE_SL_CACHE_DIR"/claude-sl-account-* "$CLAUDE_SL_CACHE_DIR"/claude-sl-seen-*
+
+# P14: rows are fitted to the terminal width (Claude Code exports COLUMNS)
+w_json="{\"workspace\":{\"current_dir\":\"$HOME/Projects/Github/clients/some-long-repository-name\"},\"model\":{\"display_name\":\"Claude Opus 5.5\"},\"effort\":\"high\",\"session_id\":\"wide1234-zz\",\"version\":\"2.1.0\",\"context_window\":{\"used_percentage\":43},\"rate_limits\":{\"five_hour\":{\"used_percentage\":33,\"resets_at\":$((port_now + 3600))},\"seven_day\":{\"used_percentage\":12,\"resets_at\":$((port_now + 400000))}}}"
+render_w() { fresh_rate; echo "$w_json" | env "$@" CLAUDE_SL_ACCOUNT_LABEL="dev@example.com" CLAUDE_SL_INSTALLED_VERSION="2.1.9" bash "$SCRIPT" 2>/dev/null | strip; }
+widest() { local l m=0; while IFS= read -r l; do (( ${#l} > m )) && m=${#l}; done <<< "$1"; echo "$m"; }
+wide=$(render_w COLUMNS=200); none=$(render_w)
+check "Wide terminal: three rows with full bars, same as with no COLUMNS" \
+  "$([ "$wide" = "$none" ] && [ "$(printf '%s' "$wide" | wc -l | tr -d ' ')" = 3 ] && [[ "$wide" == *"⛁ 43% ⣿⣿⣿⣿⣀⣀⣀⣀⣀⣀ · "* ]] && echo ok)" "$wide"
+mid=$(render_w COLUMNS=90)
+check "Medium terminal: bars halve to 5 cells, still three rows" \
+  "$([ "$(printf '%s' "$mid" | wc -l | tr -d ' ')" = 3 ] && [[ "$mid" == *"◆ Opus 5.5 high · ⛁ 43% ⣿⣿⣀⣀⣀ · "* ]] && [[ "$mid" == *"v2.1.9 ↑"* ]] && (( $(widest "$mid") <= 86 )) && echo ok)" "$mid"
+phone=$(render_w COLUMNS=50)
+check "Phone width: path abbreviated, bars dropped, labels shortened, rows wrapped — no line over the width, nothing lost" \
+  "$((( $(widest "$phone") <= 46 )) && [[ "$phone" == "…/clients/some-long-repository-name"* ]] && [[ "$phone" != *"⣿"* ]] \
+     && [[ "$phone" == *"◆ Opus 5.5 hi · ⛁ 43%"* ]] && [[ "$phone" == *"⏱ 33% ↻"* ]] && [[ "$phone" == *"⧖ 12% ↻"* ]] && [[ "$phone" == *" · ↑"* ]] && [[ "$phone" != *"2.1.9"* ]] \
+     && [[ "$phone" == *"⌂ test-host"* ]] && [[ "$phone" == *"dev@example.com"* ]] && [[ "$phone" == *"#wide1234"* ]] && echo ok)" "$phone"
+tiny=$(render_w COLUMNS=38)
+check "Narrower still: the parent folder goes too (…/folder)" "$([[ "$tiny" == "…/some-long-repository-name"* ]] && (( $(widest "$tiny") <= 34 )) && echo ok)" "$tiny"
+pinned=$(render_w COLUMNS=50 CLAUDE_SL_WIDTH=0)
+check "CLAUDE_SL_WIDTH=0 turns fitting off" "$([ "$pinned" = "$none" ] && echo ok)" "$pinned"
+
+# P15: an account with a weekly limit but no 5-hour window (the usage endpoint says five_hour: null)
+fresh_rate; rm -f "$USAGE_CACHE" "$USAGE_CACHE.err"
+nofive=$(mktemp)
+printf '{"five_hour":null,"seven_day":{"utilization":81.0,"resets_at":"%s"}}' \
+  "$(date -u -r "$((port_now + 400000))" '+%Y-%m-%dT%H:%M:%S.034514+00:00' 2>/dev/null || date -u -d "@$((port_now + 400000))" '+%Y-%m-%dT%H:%M:%S.034514+00:00')" > "$nofive"
+echo '{"model":{"display_name":"x"},"version":"2.1.0"}' \
+  | CLAUDE_SL_USAGE_TTL=1 CLAUDE_SL_USAGE_TOKEN=dummy CLAUDE_SL_USAGE_URL="file://$nofive" bash "$SCRIPT" >/dev/null 2>&1
+for i in $(seq 1 50); do [ -f "$USAGE_CACHE" ] || [ -f "$USAGE_CACHE.err" ] && break; sleep 0.1; done
+got=$(tr '\037' ' ' < "$USAGE_CACHE" 2>/dev/null)
+check "Usage answer with a null 5-hour window is accepted, not treated as a failure" "$([[ "$got" == " 0 81.0 "* ]] && [ ! -f "$USAGE_CACHE.err" ] && echo ok)" "cache='$got' err=$(cat "$USAGE_CACHE.err" 2>/dev/null)"
+out=$(echo '{"model":{"display_name":"x"},"version":"2.1.0"}' | bash "$SCRIPT" 2>/dev/null | strip)
+check "Weekly known, no 5-hour window: the ⏱ segment is left out (no misleading --)" "$([[ "$out" == *"⧖ 81% "* ]] && [[ "$out" != *"⏱"* ]] && echo ok)" "$out"
+rm -f "$nofive" "$USAGE_CACHE" "$USAGE_CACHE.err"
+
+# P16: a per-model weekly limit from the usage endpoint gets its own gauge for the matching model
+fresh_rate; rm -f "$USAGE_CACHE" "$USAGE_CACHE.err"
+scoped_fx=$(mktemp)
+iso() { date -u -r "$1" '+%Y-%m-%dT%H:%M:%S.034514+00:00' 2>/dev/null || date -u -d "@$1" '+%Y-%m-%dT%H:%M:%S.034514+00:00'; }
+printf '{"five_hour":null,"seven_day":{"utilization":81.0,"resets_at":"%s"},"limits":[{"kind":"weekly_all","percent":81,"resets_at":"%s"},{"kind":"weekly_scoped","percent":89,"resets_at":"%s","scope":{"model":{"id":null,"display_name":"Fable"}},"is_active":true}]}' \
+  "$(iso $((port_now + 400000)))" "$(iso $((port_now + 400000)))" "$(iso $((port_now + 400000)))" > "$scoped_fx"
+echo '{"model":{"display_name":"Claude Fable 5.2"},"version":"2.1.0"}' \
+  | CLAUDE_SL_USAGE_TTL=1 CLAUDE_SL_USAGE_TOKEN=dummy CLAUDE_SL_USAGE_URL="file://$scoped_fx" bash "$SCRIPT" >/dev/null 2>&1
+for i in $(seq 1 50); do [ -f "$USAGE_CACHE" ] || [ -f "$USAGE_CACHE.err" ] && break; sleep 0.1; done
+fable=$(echo '{"model":{"display_name":"Claude Fable 5.2"},"effort":"medium","version":"2.1.0"}' | bash "$SCRIPT" 2>/dev/null | strip)
+opus=$(echo '{"model":{"display_name":"Claude Opus 5.5"},"version":"2.1.0"}' | bash "$SCRIPT" 2>/dev/null | strip)
+check "Per-model weekly limit rides in the weekly segment, for the running model only" \
+  "$([[ "$fable" == *"⧖ 81% ⣿⣿⣿⣿⣿⣿⣿⣿⣀⣀ (Fable 89%) ↻"* ]] && [[ "$opus" != *"Fable"* ]] && [[ "$opus" == *"⧖ 81% ⣿⣿⣿⣿⣿⣿⣿⣿⣀⣀ ↻"* ]] && echo ok)" "$fable // $opus"
+narrow=$(echo '{"model":{"display_name":"Claude Fable 5.2"},"effort":"medium","version":"2.1.0"}' | COLUMNS=44 bash "$SCRIPT" 2>/dev/null | strip)
+check "Narrow terminal: short model names (◆ Fab 5.2 med, ⧖ 81% (Fab 89%) ↻…)" \
+  "$([[ "$narrow" == *"◆ Fab 5.2 med"* ]] && [[ "$narrow" == *"⧖ 81% (Fab 89%) ↻"* ]] && [[ "$narrow" != *"Fable"* ]] && echo ok)" "$narrow"
+# a model limit that resets at a different time carries its own reset inside the parentheses
+printf '81\037%s\037%s\037Fable=89=%s' "$((port_now + 400000))" "$port_now" "$((port_now + 200000))" | sed $'s/^/\037'"0"$'\037/' > "$USAGE_CACHE"
+differ=$(echo '{"model":{"display_name":"Claude Fable 5.2"},"version":"2.1.0"}' | bash "$SCRIPT" 2>/dev/null | strip)
+check "Model limit with its own reset time shows it inside the parentheses" "$([[ "$differ" =~ \(Fable\ 89%\ ↻[A-Z][a-z]+\.?\ [0-9]+\)\ ↻ ]] && echo ok)" "$differ"
+rm -f "$scoped_fx" "$USAGE_CACHE" "$USAGE_CACHE.err"
+
 # P12: a shared (sticky) temp dir gets a private per-uid subdirectory; an unusable one falls back to ~/.cache
 shared_tmp=$(mktemp -d); chmod 1777 "$shared_tmp"; xdg=$(mktemp -d)
 echo "$port_json" | env -u CLAUDE_SL_CACHE_DIR TMPDIR="$shared_tmp" XDG_CACHE_HOME="$xdg" bash "$SCRIPT" >/dev/null 2>&1
@@ -1203,7 +1286,7 @@ redraw_fail_iter=0
 for i in $(seq 1 20); do
   out=$(echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Opus 4.6"},"context_window":{"used_percentage":42},"rate_limits":{"five_hour":{"used_percentage":15}},"output_style":"Learning","session_name":"test"}' | bash "$SCRIPT" 2>/dev/null)
   lc=$(printf '%s' "$out" | wc -l | tr -d ' ')
-  if [ "$lc" -ne 2 ]; then
+  if [ "$lc" -ne 3 ]; then
     redraw_pass=false
     redraw_fail_iter=$i
     break
@@ -1212,7 +1295,7 @@ done
 TOTAL=$((TOTAL + 1))
 if $redraw_pass; then
   PASS=$((PASS + 1))
-  printf "  \033[32m✓\033[0m Rapid redraw (20x) — always two rows + spacer\n"
+  printf "  \033[32m✓\033[0m Rapid redraw (20x) — always three rows + spacer\n"
 else
   FAIL=$((FAIL + 1))
   printf "  \033[31m✗\033[0m Rapid redraw — wrong row count at iteration %d\n" "$redraw_fail_iter"
