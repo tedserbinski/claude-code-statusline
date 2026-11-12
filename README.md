@@ -2,11 +2,19 @@
 
 A compact, three-row statusline for [Claude Code](https://claude.com/claude-code) written in bash. Shows where you are, what's running and how much is left, and who you are: which computer, which Claude account, which session.
 
-## Screenshot
+## Screenshots
+
+**Desktop**
 
 ![Two-row statusline in Ghostty: model, effort, fast mode and output style, then folder, worktree, branch and lines changed; below, context, 5-hour and weekly usage bars, the session's messaging name, and a pending update](screenshot.png)
 
-The screenshot predates the three-row layout below (it shows the earlier two-row arrangement, without the computer and account). Every optional element is on in this shot: fast mode, a non-default output style (`☰Learning`), a linked worktree (`↳ feat-wt`), a weekly window past 80% (red), and a pending Claude Code update.
+This desktop shot predates the three-row layout described below — it shows the earlier two-row arrangement, without the computer and account — and is due to be replaced. Every optional element is on in this shot: fast mode, a non-default output style (`☰Learning`), a linked worktree (`↳ feat-wt`), a weekly window past 80% (red), and a pending Claude Code update.
+
+**Phone**
+
+<img src="screenshot-mobile.jpg" width="480" alt="Statusline in a phone-width terminal (herdr's mobile app): folder, branch and lines changed on the first line; model, context and weekly usage with the model's own limit in parentheses on the second; computer and account on the third; the session's messaging name wrapped onto a fourth">
+
+The same statusline in a phone-width terminal (here, [herdr](https://herdr.dev)'s mobile app). Nothing is cut off: the path is shortened to `…/folder`, the bars give way to colored percentages, the labels shorten (`Fab`, `med`), and the messaging name wraps onto its own line. This account has no 5-hour window, so only the weekly gauge shows, with the model's own weekly limit in parentheses.
 
 ## Layout
 
