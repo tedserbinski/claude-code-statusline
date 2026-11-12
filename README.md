@@ -6,15 +6,15 @@ A compact, three-row statusline for [Claude Code](https://claude.com/claude-code
 
 **Desktop**
 
-![Two-row statusline in Ghostty: model, effort, fast mode and output style, then folder, worktree, branch and lines changed; below, context, 5-hour and weekly usage bars, the session's messaging name, and a pending update](screenshot.png)
+![Three-row statusline in a desktop terminal: folder, branch and lines changed; then the model and effort, context, and the weekly usage bar with the model's own weekly limit in parentheses and the reset date; then the computer, the account and the session's messaging name](screenshot.png)
 
-This desktop shot predates the three-row layout described below — it shows the earlier two-row arrangement, without the computer and account — and is due to be replaced. Every optional element is on in this shot: fast mode, a non-default output style (`☰Learning`), a linked worktree (`↳ feat-wt`), a weekly window past 80% (red), and a pending Claude Code update.
+A wide terminal gets the three rows in full: the whole path, the 10-cell usage bar, and the computer, account and messaging name together on the last row. This account has no 5-hour window, so only the weekly gauge shows — past 80%, so it's red — with the model's own weekly limit in parentheses. Context reads `--` because the session hasn't had its first response yet.
 
 **Phone**
 
-<img src="screenshot-mobile.jpg" width="480" alt="Statusline in a phone-width terminal (herdr's mobile app): folder, branch and lines changed on the first line; model, context and weekly usage with the model's own limit in parentheses on the second; computer and account on the third; the session's messaging name wrapped onto a fourth">
+<img src="screenshot-mobile.jpg" width="480" alt="The same statusline in a phone-width terminal (herdr's mobile app): the folder name alone with branch and lines changed on the first line; a shortened model name, context and weekly usage without bars on the second; computer and account on the third; the session's messaging name wrapped onto a fourth">
 
-The same statusline in a phone-width terminal (here, [herdr](https://herdr.dev)'s mobile app). Nothing is cut off: the path is shortened to `…/folder`, the bars give way to colored percentages, the labels shorten (`Fab`, `med`), and the messaging name wraps onto its own line. This account has no 5-hour window, so only the weekly gauge shows, with the model's own weekly limit in parentheses.
+The same statusline in a phone-width terminal (here, [herdr](https://herdr.dev)'s mobile app). Nothing is cut off: the path is shortened to `…/folder`, the bars give way to colored percentages, the labels shorten (`Fab`, `med`), and the messaging name wraps onto its own line.
 
 ## Layout
 
